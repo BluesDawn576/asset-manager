@@ -6,10 +6,11 @@ public interface IAssetContentStore
 {
     Task PrepareLibraryAsync(LibraryLocation location, CancellationToken cancellationToken = default);
 
-    Task<IReadOnlyList<PreparedAssetFile>> CopyIntoLibraryAsync(
+    Task<AssetCopyResult> CopyIntoLibraryAsync(
         LibraryLocation location,
         LibraryRelativePath targetFolder,
         IEnumerable<string> sourcePaths,
+        AssetImportOptions? importOptions = null,
         CancellationToken cancellationToken = default);
 
     Task<PreparedAssetFile> WriteTextSnippetAsync(

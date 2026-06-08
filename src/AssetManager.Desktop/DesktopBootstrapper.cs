@@ -1,6 +1,8 @@
 using AssetManager.Application.Library;
+using AssetManager.Desktop.Localization;
 using AssetManager.Desktop.Preview;
 using AssetManager.Infrastructure.Storage.Library;
+using AssetManager.Infrastructure.Windows;
 
 namespace AssetManager.Desktop;
 
@@ -21,6 +23,8 @@ public static class DesktopBootstrapper
         return new MainWindow(
             libraryService,
             knownLibraryService,
-            BuiltInAssetPreviewRenderers.Create());
+            BuiltInAssetPreviewRenderers.Create(),
+            new UiSettingsStore(),
+            new WindowsThumbnailCacheService());
     }
 }

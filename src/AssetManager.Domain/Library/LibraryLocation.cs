@@ -6,6 +6,7 @@ public sealed record LibraryLocation
     public const string DatabaseFileName = "asset-manager.db";
     public const string LogsDirectoryName = "logs";
     public const string TempDirectoryName = "temp";
+    public const string ThumbnailsDirectoryName = "thumbnails";
 
     private LibraryLocation(string rootPath)
     {
@@ -14,6 +15,7 @@ public sealed record LibraryLocation
         DatabasePath = Path.Combine(ManagementPath, DatabaseFileName);
         LogsPath = Path.Combine(ManagementPath, LogsDirectoryName);
         TempPath = Path.Combine(ManagementPath, TempDirectoryName);
+        ThumbnailsPath = Path.Combine(ManagementPath, ThumbnailsDirectoryName);
     }
 
     public string RootPath { get; }
@@ -25,6 +27,8 @@ public sealed record LibraryLocation
     public string LogsPath { get; }
 
     public string TempPath { get; }
+
+    public string ThumbnailsPath { get; }
 
     public static LibraryLocation Create(string rootPath)
     {

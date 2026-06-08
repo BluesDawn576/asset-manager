@@ -4,6 +4,7 @@ using AssetManager.Infrastructure.Storage.Library;
 using AssetManager.Plugin.Abstractions;
 using AssetManager.Plugin.Host;
 using AssetManager.Plugin.Sdk;
+using System.Security.Cryptography;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
@@ -34,6 +35,10 @@ public class UnitTest1
                 tempRoot,
                 LibraryLocation.ManagementDirectoryName,
                 LibraryLocation.LogsDirectoryName)));
+            Assert.True(Directory.Exists(Path.Combine(
+                tempRoot,
+                LibraryLocation.ManagementDirectoryName,
+                LibraryLocation.ThumbnailsDirectoryName)));
         }
         finally
         {
@@ -106,6 +111,66 @@ public class UnitTest1
             Assert.Equal(["demo (1).txt", "demo.txt"], relativePaths);
             Assert.True(File.Exists(Path.Combine(libraryRoot, "demo.txt")));
             Assert.True(File.Exists(Path.Combine(libraryRoot, "demo (1).txt")));
+        }
+        finally
+        {
+            DeleteTempRoot(libraryRoot);
+            DeleteTempRoot(sourceRoot);
+        }
+    }
+
+    [Fact]
+    public async Task ImportPaths_PreservesContentHashForImportedFile()
+    {
+        var libraryRoot = CreateTempRoot();
+        var sourceRoot = CreateTempRoot();
+
+        try
+        {
+            var sourceFile = Path.Combine(sourceRoot, "clip.txt");
+            File.WriteAllText(sourceFile, "content hash regression");
+
+            var service = CreateLibraryService();
+            var session = await service.OpenOrCreateAsync(libraryRoot);
+            var imported = (await service.ImportPathsAsync(session.Location, LibraryRelativePath.Root, [sourceFile]))
+                .ImportedAssets
+                .Single();
+
+            var expectedHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(
+                Path.Combine(libraryRoot, "clip.txt"))));
+
+            Assert.Equal(expectedHash, imported.ContentHash);
+        }
+        finally
+        {
+            DeleteTempRoot(libraryRoot);
+            DeleteTempRoot(sourceRoot);
+        }
+    }
+
+    [Fact]
+    public async Task ImportPaths_ReturnsCreatedFoldersForEmptyDirectoryImport()
+    {
+        var libraryRoot = CreateTempRoot();
+        var sourceRoot = CreateTempRoot();
+
+        try
+        {
+            var sourceFolder = Path.Combine(sourceRoot, "package");
+            Directory.CreateDirectory(Path.Combine(sourceFolder, "nested"));
+
+            var service = CreateLibraryService();
+            var session = await service.OpenOrCreateAsync(libraryRoot);
+            var result = await service.ImportPathsAsync(session.Location, LibraryRelativePath.Root, [sourceFolder]);
+
+            Assert.Empty(result.ImportedAssets);
+            Assert.Equal(
+                ["package", "package/nested"],
+                result.ImportedFolders
+                    .Select(folder => folder.Value)
+                    .Order(StringComparer.OrdinalIgnoreCase)
+                    .ToArray());
+            Assert.True(Directory.Exists(Path.Combine(libraryRoot, "package", "nested")));
         }
         finally
         {

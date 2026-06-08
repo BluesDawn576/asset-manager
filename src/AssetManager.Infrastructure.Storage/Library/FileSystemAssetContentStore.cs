@@ -1,4 +1,6 @@
+using System.Buffers;
 using System.Security.Cryptography;
+using System.Diagnostics;
 using System.Text;
 using AssetManager.Application.Library;
 using AssetManager.Domain.Library;
@@ -7,6 +9,8 @@ namespace AssetManager.Infrastructure.Storage.Library;
 
 public sealed class FileSystemAssetContentStore : IAssetContentStore
 {
+    private const int CopyBufferSize = 128 * 1024;
+
     private readonly IAssetTypeResolver _assetTypeResolver;
 
     public FileSystemAssetContentStore(IAssetTypeResolver assetTypeResolver)
@@ -20,13 +24,15 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         Directory.CreateDirectory(location.ManagementPath);
         Directory.CreateDirectory(location.LogsPath);
         Directory.CreateDirectory(location.TempPath);
+        Directory.CreateDirectory(location.ThumbnailsPath);
         return Task.CompletedTask;
     }
 
-    public async Task<IReadOnlyList<PreparedAssetFile>> CopyIntoLibraryAsync(
+    public async Task<AssetCopyResult> CopyIntoLibraryAsync(
         LibraryLocation location,
         LibraryRelativePath targetFolder,
         IEnumerable<string> sourcePaths,
+        AssetImportOptions? importOptions = null,
         CancellationToken cancellationToken = default)
     {
         var targetFolderPath = targetFolder.ToFullPath(location.RootPath);
@@ -36,6 +42,8 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         }
 
         var copiedFiles = new List<PreparedAssetFile>();
+        var createdFolders = new HashSet<LibraryRelativePath>();
+        var copyThrottle = CopyThrottle.Create(importOptions);
         try
         {
             foreach (var rawPath in sourcePaths)
@@ -55,17 +63,25 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
                         sourcePath,
                         targetFolderPath,
                         [],
+                        copyThrottle,
                         cancellationToken));
                     continue;
                 }
 
                 if (Directory.Exists(sourcePath))
                 {
-                    copiedFiles.AddRange(await CopyDirectoryAsync(
+                    var copyResult = await CopyDirectoryAsync(
                         location,
                         sourcePath,
                         targetFolderPath,
-                        cancellationToken));
+                        copyThrottle,
+                        cancellationToken);
+                    copiedFiles.AddRange(copyResult.CopiedFiles);
+                    foreach (var createdFolder in copyResult.CreatedFolders)
+                    {
+                        createdFolders.Add(createdFolder);
+                    }
+
                     continue;
                 }
 
@@ -78,7 +94,12 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
             throw;
         }
 
-        return copiedFiles;
+        return new AssetCopyResult(
+            copiedFiles,
+            createdFolders
+                .OrderBy(folder => folder.Value.Count(ch => ch == '/'))
+                .ThenBy(folder => folder.Value, StringComparer.OrdinalIgnoreCase)
+                .ToArray());
     }
 
     public async Task<PreparedAssetFile> WriteTextSnippetAsync(
@@ -207,10 +228,11 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         return new string(buffer, 0, count);
     }
 
-    private async Task<IReadOnlyList<PreparedAssetFile>> CopyDirectoryAsync(
+    private async Task<AssetCopyResult> CopyDirectoryAsync(
         LibraryLocation location,
         string sourceDirectory,
         string targetFolderPath,
+        CopyThrottle? copyThrottle,
         CancellationToken cancellationToken)
     {
         if (IsSameOrDescendantPath(targetFolderPath, sourceDirectory))
@@ -247,14 +269,14 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
                 var relativeFile = Path.GetRelativePath(sourceDirectory, file);
                 var destinationFile = Path.Combine(destinationRoot, relativeFile);
                 Directory.CreateDirectory(Path.GetDirectoryName(destinationFile)!);
-                File.Copy(file, destinationFile, overwrite: false);
                 try
                 {
-                    copiedFiles.Add(await BuildPreparedAssetFileAsync(
+                    copiedFiles.Add(await CopyImportedFileAsync(
                         location,
-                        destinationFile,
                         file,
+                        destinationFile,
                         createdDirectories,
+                        copyThrottle,
                         cancellationToken));
                 }
                 catch
@@ -268,7 +290,7 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
                 }
             }
 
-            return copiedFiles;
+            return new AssetCopyResult(copiedFiles, createdDirectories);
         }
         catch
         {
@@ -283,13 +305,19 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         string sourcePath,
         string targetFolderPath,
         IReadOnlyList<LibraryRelativePath> createdDirectories,
+        CopyThrottle? copyThrottle,
         CancellationToken cancellationToken)
     {
         var destinationPath = GetUniqueFilePath(Path.Combine(targetFolderPath, Path.GetFileName(sourcePath)));
-        File.Copy(sourcePath, destinationPath, overwrite: false);
         try
         {
-            return await BuildPreparedAssetFileAsync(location, destinationPath, sourcePath, createdDirectories, cancellationToken);
+            return await CopyImportedFileAsync(
+                location,
+                sourcePath,
+                destinationPath,
+                createdDirectories,
+                copyThrottle,
+                cancellationToken);
         }
         catch
         {
@@ -300,6 +328,30 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
 
             throw;
         }
+    }
+
+    private async Task<PreparedAssetFile> CopyImportedFileAsync(
+        LibraryLocation location,
+        string sourcePath,
+        string destinationPath,
+        IReadOnlyList<LibraryRelativePath> createdDirectories,
+        CopyThrottle? copyThrottle,
+        CancellationToken cancellationToken)
+    {
+        var sourceFileInfo = new FileInfo(sourcePath);
+        var contentHash = await CopyFileAndComputeHashAsync(
+            sourcePath,
+            destinationPath,
+            copyThrottle,
+            cancellationToken);
+        ApplySourceFileMetadata(sourceFileInfo, destinationPath);
+
+        return CreatePreparedAssetFile(
+            location,
+            destinationPath,
+            sourcePath,
+            createdDirectories,
+            contentHash);
     }
 
     private static void DeleteCopiedFilesAndCreatedDirectories(
@@ -350,10 +402,7 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         CancellationToken cancellationToken)
     {
         var storedFile = await BuildStoredContentFileAsync(location, destinationPath, cancellationToken);
-        return storedFile.ToPreparedAssetFile(sourcePath, DateTimeOffset.UtcNow) with
-        {
-            CreatedDirectories = createdDirectories
-        };
+        return ToPreparedAssetFile(storedFile, sourcePath, createdDirectories);
     }
 
     private async Task<StoredContentFile> BuildStoredContentFileAsync(
@@ -362,15 +411,10 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         CancellationToken cancellationToken)
     {
         var fileInfo = new FileInfo(fullPath);
-        var extension = fileInfo.Extension;
-        return new StoredContentFile(
-            fileInfo.Name,
-            ToLibraryRelativePath(location, fullPath),
-            _assetTypeResolver.Resolve(extension),
-            extension,
-            fileInfo.Length,
-            fileInfo.CreationTimeUtc,
-            fileInfo.LastWriteTimeUtc,
+        return CreateStoredContentFile(
+            location,
+            fullPath,
+            fileInfo,
             await HashFileAsync(fullPath, cancellationToken));
     }
 
@@ -380,6 +424,153 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         using var sha256 = SHA256.Create();
         var hash = await sha256.ComputeHashAsync(stream, cancellationToken);
         return Convert.ToHexString(hash);
+    }
+
+    private static async Task<string> CopyFileAndComputeHashAsync(
+        string sourcePath,
+        string destinationPath,
+        CopyThrottle? copyThrottle,
+        CancellationToken cancellationToken)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
+
+        try
+        {
+            await using var sourceStream = new FileStream(
+                sourcePath,
+                new FileStreamOptions
+                {
+                    Mode = FileMode.Open,
+                    Access = FileAccess.Read,
+                    Share = FileShare.Read,
+                    BufferSize = CopyBufferSize,
+                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan
+                });
+            await using var destinationStream = new FileStream(
+                destinationPath,
+                new FileStreamOptions
+                {
+                    Mode = FileMode.CreateNew,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    BufferSize = CopyBufferSize,
+                    Options = FileOptions.Asynchronous
+                });
+
+            using var incrementalHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+            while (true)
+            {
+                var bytesRead = await sourceStream.ReadAsync(
+                    buffer.AsMemory(0, CopyBufferSize),
+                    cancellationToken);
+                if (bytesRead == 0)
+                {
+                    break;
+                }
+
+                incrementalHash.AppendData(buffer, 0, bytesRead);
+                await destinationStream.WriteAsync(
+                    buffer.AsMemory(0, bytesRead),
+                    cancellationToken);
+
+                if (copyThrottle is not null)
+                {
+                    await copyThrottle.ThrottleAsync(bytesRead, cancellationToken);
+                }
+            }
+
+            await destinationStream.FlushAsync(cancellationToken);
+            return Convert.ToHexString(incrementalHash.GetHashAndReset());
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private sealed class CopyThrottle
+    {
+        private readonly Stopwatch _elapsed = Stopwatch.StartNew();
+        private readonly long _maxBytesPerSecond;
+        private long _copiedBytes;
+
+        private CopyThrottle(long maxBytesPerSecond)
+        {
+            _maxBytesPerSecond = maxBytesPerSecond;
+        }
+
+        public static CopyThrottle? Create(AssetImportOptions? importOptions)
+        {
+            return importOptions?.MaxCopyBytesPerSecond is > 0
+                ? new CopyThrottle(importOptions.MaxCopyBytesPerSecond.Value)
+                : null;
+        }
+
+        public async Task ThrottleAsync(int copiedBytes, CancellationToken cancellationToken)
+        {
+            _copiedBytes += copiedBytes;
+
+            var expectedElapsed = TimeSpan.FromSeconds((double)_copiedBytes / _maxBytesPerSecond);
+            var delay = expectedElapsed - _elapsed.Elapsed;
+            if (delay > TimeSpan.FromMilliseconds(10))
+            {
+                await Task.Delay(delay, cancellationToken);
+            }
+        }
+    }
+
+    private static void ApplySourceFileMetadata(FileInfo sourceFileInfo, string destinationPath)
+    {
+        File.SetAttributes(destinationPath, sourceFileInfo.Attributes);
+        File.SetCreationTimeUtc(destinationPath, sourceFileInfo.CreationTimeUtc);
+        File.SetLastWriteTimeUtc(destinationPath, sourceFileInfo.LastWriteTimeUtc);
+    }
+
+    private PreparedAssetFile CreatePreparedAssetFile(
+        LibraryLocation location,
+        string destinationPath,
+        string? sourcePath,
+        IReadOnlyList<LibraryRelativePath> createdDirectories,
+        string contentHash)
+    {
+        var storedFile = CreateStoredContentFile(
+            location,
+            destinationPath,
+            new FileInfo(destinationPath),
+            contentHash);
+
+        return ToPreparedAssetFile(storedFile, sourcePath, createdDirectories);
+    }
+
+    private PreparedAssetFile ToPreparedAssetFile(
+        StoredContentFile storedFile,
+        string? sourcePath,
+        IReadOnlyList<LibraryRelativePath> createdDirectories)
+    {
+        return storedFile.ToPreparedAssetFile(sourcePath, DateTimeOffset.UtcNow) with
+        {
+            CreatedDirectories = createdDirectories
+        };
+    }
+
+    private StoredContentFile CreateStoredContentFile(
+        LibraryLocation location,
+        string fullPath,
+        FileInfo fileInfo,
+        string contentHash)
+    {
+        var extension = fileInfo.Extension;
+
+        return new StoredContentFile(
+            fileInfo.Name,
+            ToLibraryRelativePath(location, fullPath),
+            _assetTypeResolver.Resolve(extension),
+            extension,
+            fileInfo.Length,
+            fileInfo.CreationTimeUtc,
+            fileInfo.LastWriteTimeUtc,
+            contentHash);
     }
 
     private static LibraryRelativePath ToLibraryRelativePath(LibraryLocation location, string fullPath)

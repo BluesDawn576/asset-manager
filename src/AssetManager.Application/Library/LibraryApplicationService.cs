@@ -29,29 +29,35 @@ public sealed class LibraryApplicationService(
         LibraryLocation location,
         LibraryRelativePath currentFolder,
         IEnumerable<string> sourcePaths,
+        AssetImportOptions? importOptions = null,
         CancellationToken cancellationToken = default)
     {
         var sources = sourcePaths.Where(path => !string.IsNullOrWhiteSpace(path)).ToArray();
         if (sources.Length == 0)
         {
-            return new AssetImportResult([]);
+            return new AssetImportResult([], []);
         }
 
-        var copiedFiles = await contentStore.CopyIntoLibraryAsync(location, currentFolder, sources, cancellationToken);
-        if (copiedFiles.Count == 0)
+        var copyResult = await contentStore.CopyIntoLibraryAsync(
+            location,
+            currentFolder,
+            sources,
+            importOptions,
+            cancellationToken);
+        if (copyResult.CopiedFiles.Count == 0)
         {
-            return new AssetImportResult([]);
+            return new AssetImportResult([], copyResult.CreatedFolders);
         }
 
         try
         {
-            var importedAssets = await repository.AddAssetsAsync(location, copiedFiles, cancellationToken);
+            var importedAssets = await repository.AddAssetsAsync(location, copyResult.CopiedFiles, cancellationToken);
             await activityLog.AppendAsync(location, $"Imported {importedAssets.Count} asset(s).", cancellationToken);
-            return new AssetImportResult(importedAssets);
+            return new AssetImportResult(importedAssets, copyResult.CreatedFolders);
         }
         catch
         {
-            await contentStore.RollbackCopiedAssetsAsync(location, copiedFiles, cancellationToken);
+            await contentStore.RollbackCopiedAssetsAsync(location, copyResult.CopiedFiles, cancellationToken);
             await activityLog.AppendAsync(location, "Import failed; copied files were rolled back.", cancellationToken);
             throw;
         }

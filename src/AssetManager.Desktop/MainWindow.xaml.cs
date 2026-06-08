@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Input;
 using AssetManager.Application.Library;
 using AssetManager.Desktop.Localization;
@@ -18,6 +19,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly LibraryApplicationService _libraryService;
     private readonly KnownLibraryApplicationService _knownLibraryService;
     private readonly AssetPreviewPresenter _previewPresenter;
+    private readonly UiSettingsStore _uiSettingsStore;
+    private readonly AssetThumbnailLoadCoordinator _thumbnailLoadCoordinator;
 
     private LibraryLocation? _libraryLocation;
     private LibraryRelativePath _currentFolder = LibraryRelativePath.Root;
@@ -25,19 +28,31 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private string _statusMessage = string.Empty;
     private string _libraryRootMessage = string.Empty;
     private string _currentFolderMessage = string.Empty;
+    private string _currentImportTargetDisplayName = string.Empty;
     private bool _isSelectingFolder;
     private bool _isRefreshingKnownLibraries;
     private bool _isChangingLanguage;
+    private bool _isImporting;
+    private bool _isSynchronizing;
+    private bool _isLowImpactImportEnabled;
+    private int _currentImportSourceCount;
+    private ThumbnailDisplaySettings _thumbnailDisplaySettings = ThumbnailDisplaySettings.Default;
+    private ThumbnailLoadStatus _thumbnailLoadStatus = ThumbnailLoadStatus.Idle;
 
     public MainWindow(
         LibraryApplicationService libraryService,
         KnownLibraryApplicationService knownLibraryService,
-        IReadOnlyList<IAssetPreviewRenderer> previewRenderers)
+        IReadOnlyList<IAssetPreviewRenderer> previewRenderers,
+        UiSettingsStore uiSettingsStore,
+        WindowsThumbnailCacheService thumbnailCacheService)
     {
         _libraryService = libraryService;
         _knownLibraryService = knownLibraryService;
+        _uiSettingsStore = uiSettingsStore;
 
         InitializeComponent();
+        _thumbnailLoadCoordinator = new AssetThumbnailLoadCoordinator(thumbnailCacheService, Dispatcher);
+        _thumbnailLoadCoordinator.StatusChanged += OnThumbnailLoadStatusChanged;
         _previewPresenter = new AssetPreviewPresenter(
             previewRenderers,
             new PreviewSurface(
@@ -65,7 +80,26 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public ObservableCollection<AssetRow> Assets { get; } = new();
 
-    public ObservableCollection<LibraryFolderRow> Folders { get; } = new();
+    public ObservableCollection<LibraryFolderNode> FolderRoots { get; } = new();
+
+    public bool CanInteract => !_isImporting;
+
+    public string BackgroundTaskStatusMessage => BuildBackgroundTaskStatusMessage();
+
+    public bool IsLowImpactImportEnabled
+    {
+        get => _isLowImpactImportEnabled;
+        private set
+        {
+            if (_isLowImpactImportEnabled == value)
+            {
+                return;
+            }
+
+            _isLowImpactImportEnabled = value;
+            OnPropertyChanged(nameof(IsLowImpactImportEnabled));
+        }
+    }
 
     public string StatusMessage
     {
@@ -114,7 +148,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    private async void LanguageBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    protected override void OnClosed(EventArgs e)
+    {
+        _thumbnailLoadCoordinator.StatusChanged -= OnThumbnailLoadStatusChanged;
+        _thumbnailLoadCoordinator.Dispose();
+        base.OnClosed(e);
+    }
+
+    private async void LanguageBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_isChangingLanguage || LanguageBox.SelectedItem is not LanguageOption languageOption)
         {
@@ -141,6 +182,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 UpdateLibraryRootMessage();
             }
 
+            OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
             StatusMessage = LocalizationManager.Get("StatusLanguageChanged");
         });
     }
@@ -149,6 +191,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         await RunUiAsync(async () =>
         {
+            await LoadThumbnailDisplaySettingsAsync();
+            await LoadImportBehaviorSettingsAsync();
+
             var activeLibrary = await _knownLibraryService.GetActiveAsync();
             await RefreshKnownLibrariesAsync(activeLibrary?.Id);
 
@@ -203,7 +248,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         });
     }
 
-    private async void KnownLibraryBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    private async void KnownLibraryBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_isRefreshingKnownLibraries || KnownLibraryBox.SelectedItem is not KnownLibraryRow row)
         {
@@ -307,15 +352,23 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         await RunUiAsync(async () =>
         {
-            var result = await _libraryService.SynchronizeAsync(location);
-            await RefreshFoldersAsync(_currentFolder);
-            await RefreshAssetsAsync();
-            StatusMessage = LocalizationManager.Format(
-                "StatusSyncCompleteFormat",
-                result.UpdatedCount,
-                result.MovedCount,
-                result.MissingCount,
-                result.NewAssetCount);
+            SetSynchronizing(true);
+            try
+            {
+                var result = await _libraryService.SynchronizeAsync(location);
+                await RefreshFoldersAsync(_currentFolder);
+                await RefreshAssetsAsync();
+                StatusMessage = LocalizationManager.Format(
+                    "StatusSyncCompleteFormat",
+                    result.UpdatedCount,
+                    result.MovedCount,
+                    result.MissingCount,
+                    result.NewAssetCount);
+            }
+            finally
+            {
+                SetSynchronizing(false);
+            }
         });
     }
 
@@ -355,9 +408,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         });
     }
 
-    private async void FolderList_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    private async void FolderTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
     {
-        if (_isSelectingFolder || FolderList.SelectedItem is not LibraryFolderRow folder)
+        if (_isSelectingFolder || e.NewValue is not LibraryFolderNode folder)
         {
             return;
         }
@@ -367,7 +420,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await RunUiAsync(() => RefreshAssetsAsync());
     }
 
-    private async void AssetList_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    private async void AssetList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (AssetList.SelectedItem is not AssetRow row)
         {
@@ -380,6 +433,35 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         SelectedNameText.Text = row.DisplayName;
         SelectedPathText.Text = row.RelativePath;
         await RunUiAsync(() => LoadPreviewAsync(row));
+    }
+
+    private async void ThumbnailFieldsButton_Click(object sender, RoutedEventArgs e)
+    {
+        var dialog = new ThumbnailFieldSettingsDialog(_thumbnailDisplaySettings)
+        {
+            Owner = this
+        };
+
+        if (dialog.ShowDialog() != true)
+        {
+            return;
+        }
+
+        await RunUiAsync(async () =>
+        {
+            ApplyThumbnailDisplaySettings(dialog.Settings);
+            await _uiSettingsStore.SaveThumbnailDisplaySettingsAsync(dialog.Settings);
+        });
+    }
+
+    private async void LowImpactImportCheckBox_Click(object sender, RoutedEventArgs e)
+    {
+        IsLowImpactImportEnabled = LowImpactImportCheckBox.IsChecked == true;
+
+        await RunUiAsync(async () =>
+        {
+            await _uiSettingsStore.SaveLowImpactImportEnabledAsync(IsLowImpactImportEnabled);
+        });
     }
 
     private void AssetGrid_DragOver(object sender, DragEventArgs e)
@@ -467,16 +549,59 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        await RunUiAsync(async () =>
+        if (_isImporting)
         {
-            var result = await _libraryService.ImportPathsAsync(location, _currentFolder, paths);
-            await RefreshFoldersAsync(_currentFolder);
-            await RefreshAssetsAsync(result.ImportedAssets.FirstOrDefault()?.Id);
+            return;
+        }
+
+        var normalizedPaths = NormalizeImportPaths(paths);
+        if (normalizedPaths.Length == 0)
+        {
+            StatusMessage = LocalizationManager.Get("StatusNoFilePathsInDropData");
+            return;
+        }
+
+        var targetFolder = _currentFolder;
+        var importOptions = IsLowImpactImportEnabled
+            ? AssetImportOptions.LowImpact
+            : AssetImportOptions.Default;
+        SetImporting(true, normalizedPaths.Length, FormatFolderName(targetFolder));
+        StatusMessage = LocalizationManager.Format(
+            "StatusImportingIntoFormat",
+            FormatFolderName(targetFolder));
+
+        try
+        {
+            var result = await Task.Run(() =>
+                _libraryService.ImportPathsAsync(location, targetFolder, normalizedPaths, importOptions));
+
+            ApplyImportedFoldersIncrementally(result.ImportedFolders, targetFolder);
+
+            if (HasActiveAssetFilter())
+            {
+                if (result.ImportedCount > 0)
+                {
+                    await RefreshAssetsAsync(result.ImportedAssets.FirstOrDefault()?.Id);
+                }
+            }
+            else
+            {
+                ApplyImportedAssetsIncrementally(result.ImportedAssets);
+            }
+
             StatusMessage = LocalizationManager.Format(
                 "StatusImportedIntoFormat",
                 result.ImportedCount,
-                FormatFolderName(_currentFolder));
-        });
+                FormatFolderName(targetFolder));
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = ex.Message;
+        }
+        finally
+        {
+            SetImporting(false);
+        }
     }
 
     private async Task RefreshFoldersAsync(LibraryRelativePath selectedFolder)
@@ -489,19 +614,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _isSelectingFolder = true;
         try
         {
-            Folders.Clear();
-            var folders = await _libraryService.ListFoldersAsync(_libraryLocation);
-            foreach (var folder in folders)
-            {
-                Folders.Add(new LibraryFolderRow(folder.RelativePath));
-            }
+            FolderRoots.Clear();
+            var folderList = await _libraryService.ListFoldersAsync(_libraryLocation);
+            var rootNode = BuildFolderTree(folderList);
+            rootNode.IsExpanded = true;
+            FolderRoots.Add(rootNode);
 
-            var selected = Folders.FirstOrDefault(folder =>
-                               string.Equals(folder.RelativePath.Value, selectedFolder.Value, StringComparison.OrdinalIgnoreCase))
-                           ?? Folders.First(folder => folder.RelativePath.IsRoot);
+            var selectedNode = FindFolderNode(rootNode, selectedFolder) ?? rootNode;
+            selectedNode.ExpandAncestors();
+            selectedNode.IsExpanded = true;
+            selectedNode.IsSelected = true;
 
-            FolderList.SelectedItem = selected;
-            _currentFolder = selected.RelativePath;
+            _currentFolder = selectedNode.RelativePath;
             UpdateCurrentFolderMessage();
         }
         finally
@@ -514,23 +638,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         if (_libraryLocation is null)
         {
+            _thumbnailLoadCoordinator.Cancel();
             return;
         }
-
-        var requiredTags = TagFilterBox.Text.Split(
-            [',', ';', '\r', '\n'],
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
         var assets = await _libraryService.SearchAsync(
             _libraryLocation,
             _currentFolder,
             SearchBox.Text,
-            requiredTags);
+            ParseTagFilter());
 
         Assets.Clear();
         foreach (var asset in assets)
         {
-            Assets.Add(new AssetRow(asset, asset.FullPath(_libraryLocation)));
+            Assets.Add(new AssetRow(asset, asset.FullPath(_libraryLocation), _thumbnailDisplaySettings));
         }
 
         if (selectedAssetId is not null)
@@ -542,6 +663,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             ClearDetails();
         }
+
+        ScheduleThumbnailLoading();
     }
 
     private async Task LoadPreviewAsync(AssetRow row)
@@ -648,6 +771,294 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         await RefreshAssetsAsync();
     }
 
+    private async Task LoadThumbnailDisplaySettingsAsync()
+    {
+        ApplyThumbnailDisplaySettings(await _uiSettingsStore.GetThumbnailDisplaySettingsAsync());
+    }
+
+    private async Task LoadImportBehaviorSettingsAsync()
+    {
+        IsLowImpactImportEnabled = await _uiSettingsStore.GetLowImpactImportEnabledAsync();
+    }
+
+    private void ApplyThumbnailDisplaySettings(ThumbnailDisplaySettings settings)
+    {
+        _thumbnailDisplaySettings = settings;
+        foreach (var asset in Assets)
+        {
+            asset.ApplyThumbnailDisplaySettings(settings);
+        }
+    }
+
+    private void ApplyImportedFoldersIncrementally(
+        IReadOnlyList<LibraryRelativePath> importedFolders,
+        LibraryRelativePath selectedFolder)
+    {
+        if (FolderRoots.Count == 0)
+        {
+            var rootNode = new LibraryFolderNode(LibraryRelativePath.Root)
+            {
+                IsExpanded = true
+            };
+            FolderRoots.Add(rootNode);
+        }
+
+        var root = FolderRoots[0];
+        foreach (var folder in importedFolders
+                     .Where(folder => !folder.IsRoot)
+                     .Distinct()
+                     .OrderBy(folder => folder.Value.Count(ch => ch == '/'))
+                     .ThenBy(folder => folder.Value, StringComparer.OrdinalIgnoreCase))
+        {
+            EnsureFolderNode(root, folder);
+        }
+
+        var selectedNode = FindFolderNode(root, selectedFolder) ?? root;
+        selectedNode.ExpandAncestors();
+        selectedNode.IsExpanded = true;
+        _currentFolder = selectedNode.RelativePath;
+        UpdateCurrentFolderMessage();
+    }
+
+    private void ApplyImportedAssetsIncrementally(IReadOnlyList<AssetRecord> importedAssets)
+    {
+        if (_libraryLocation is null || importedAssets.Count == 0)
+        {
+            return;
+        }
+
+        var visibleAssets = importedAssets
+            .Where(asset => IsVisibleInCurrentFolder(asset, _currentFolder))
+            .OrderByDescending(asset => asset.ImportedAt)
+            .ThenBy(asset => asset.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (visibleAssets.Length == 0)
+        {
+            return;
+        }
+
+        var importedIds = visibleAssets
+            .Select(asset => asset.Id)
+            .ToHashSet();
+
+        for (var index = Assets.Count - 1; index >= 0; index--)
+        {
+            if (importedIds.Contains(Assets[index].Id))
+            {
+                Assets.RemoveAt(index);
+            }
+        }
+
+        for (var index = visibleAssets.Length - 1; index >= 0; index--)
+        {
+            Assets.Insert(0, new AssetRow(
+                visibleAssets[index],
+                visibleAssets[index].FullPath(_libraryLocation),
+                _thumbnailDisplaySettings));
+        }
+
+        AssetList.SelectedItem = Assets.FirstOrDefault(asset => asset.Id == visibleAssets[0].Id);
+        ScheduleThumbnailLoading();
+    }
+
+    private IReadOnlyList<string> ParseTagFilter()
+    {
+        return TagFilterBox.Text.Split(
+            [',', ';', '\r', '\n'],
+            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private bool HasActiveAssetFilter()
+    {
+        return !string.IsNullOrWhiteSpace(SearchBox.Text) || ParseTagFilter().Count > 0;
+    }
+
+    private void ScheduleThumbnailLoading()
+    {
+        if (_libraryLocation is null)
+        {
+            _thumbnailLoadCoordinator.Cancel();
+            return;
+        }
+
+        _thumbnailLoadCoordinator.Reload(_libraryLocation, Assets);
+    }
+
+    private void SetImporting(
+        bool isImporting,
+        int sourceCount = 0,
+        string? targetDisplayName = null)
+    {
+        if (_isImporting == isImporting)
+        {
+            if (isImporting)
+            {
+                _currentImportSourceCount = sourceCount;
+                _currentImportTargetDisplayName = targetDisplayName ?? string.Empty;
+                OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+            }
+
+            return;
+        }
+
+        _isImporting = isImporting;
+        if (isImporting)
+        {
+            _currentImportSourceCount = sourceCount;
+            _currentImportTargetDisplayName = targetDisplayName ?? string.Empty;
+        }
+        else
+        {
+            _currentImportSourceCount = 0;
+            _currentImportTargetDisplayName = string.Empty;
+        }
+
+        OnPropertyChanged(nameof(CanInteract));
+        OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+    }
+
+    private void SetSynchronizing(bool isSynchronizing)
+    {
+        if (_isSynchronizing == isSynchronizing)
+        {
+            return;
+        }
+
+        _isSynchronizing = isSynchronizing;
+        OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+    }
+
+    private static string[] NormalizeImportPaths(IEnumerable<string> paths)
+    {
+        var uniquePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                continue;
+            }
+
+            uniquePaths.Add(Path.GetFullPath(path));
+        }
+
+        return uniquePaths.ToArray();
+    }
+
+    private static bool IsVisibleInCurrentFolder(AssetRecord asset, LibraryRelativePath currentFolder)
+    {
+        return currentFolder.IsRoot
+               || asset.LibraryRelativePath.Value.StartsWith(
+                   currentFolder.Value + "/",
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static LibraryFolderNode BuildFolderTree(IReadOnlyList<LibraryFolder> folders)
+    {
+        var rootNode = new LibraryFolderNode(LibraryRelativePath.Root);
+        var nodesByPath = new Dictionary<string, LibraryFolderNode>(StringComparer.OrdinalIgnoreCase)
+        {
+            [LibraryRelativePath.Root.Value] = rootNode
+        };
+
+        foreach (var folder in folders
+                     .Where(folder => !folder.RelativePath.IsRoot)
+                     .OrderBy(folder => folder.RelativePath.Value.Count(ch => ch == '/'))
+                     .ThenBy(folder => folder.RelativePath.Value, StringComparer.OrdinalIgnoreCase))
+        {
+            var parentPath = GetParentFolderPath(folder.RelativePath);
+            if (!nodesByPath.TryGetValue(parentPath.Value, out var parentNode))
+            {
+                continue;
+            }
+
+            var node = new LibraryFolderNode(folder.RelativePath, parentNode);
+            nodesByPath[folder.RelativePath.Value] = node;
+            parentNode.Children.Add(node);
+        }
+
+        return rootNode;
+    }
+
+    private static LibraryFolderNode EnsureFolderNode(LibraryFolderNode root, LibraryRelativePath path)
+    {
+        if (path.IsRoot)
+        {
+            return root;
+        }
+
+        var current = root;
+        foreach (var segment in path.Value.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var childPath = current.RelativePath.Combine(segment);
+            var child = current.Children.FirstOrDefault(existing =>
+                string.Equals(existing.RelativePath.Value, childPath.Value, StringComparison.OrdinalIgnoreCase));
+
+            if (child is null)
+            {
+                child = new LibraryFolderNode(childPath, current);
+                InsertChildNode(current.Children, child);
+            }
+
+            current = child;
+        }
+
+        return current;
+    }
+
+    private static LibraryFolderNode? FindFolderNode(LibraryFolderNode node, LibraryRelativePath target)
+    {
+        if (string.Equals(node.RelativePath.Value, target.Value, StringComparison.OrdinalIgnoreCase))
+        {
+            return node;
+        }
+
+        foreach (var child in node.Children)
+        {
+            var found = FindFolderNode(child, target);
+            if (found is not null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static LibraryRelativePath GetParentFolderPath(LibraryRelativePath path)
+    {
+        if (path.IsRoot)
+        {
+            return LibraryRelativePath.Root;
+        }
+
+        var separatorIndex = path.Value.LastIndexOf('/');
+        return separatorIndex < 0
+            ? LibraryRelativePath.Root
+            : LibraryRelativePath.Create(path.Value[..separatorIndex]);
+    }
+
+    private static void InsertChildNode(
+        ObservableCollection<LibraryFolderNode> children,
+        LibraryFolderNode node)
+    {
+        var insertAt = 0;
+        while (insertAt < children.Count)
+        {
+            var comparison = StringComparer.OrdinalIgnoreCase.Compare(
+                children[insertAt].DisplayName,
+                node.DisplayName);
+            if (comparison > 0)
+            {
+                break;
+            }
+
+            insertAt++;
+        }
+
+        children.Insert(insertAt, node);
+    }
+
     private async Task RunUiAsync(Func<Task> action)
     {
         try
@@ -663,6 +1074,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void OnPropertyChanged(string propertyName)
     {
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
+
+    private void OnThumbnailLoadStatusChanged(ThumbnailLoadStatus status)
+    {
+        _thumbnailLoadStatus = status;
+        OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
     }
 
     private void SelectCurrentLanguage()
@@ -697,40 +1114,159 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         return folder.IsRoot ? LocalizationManager.Get("LibraryRootFolder") : folder.Value;
     }
+
+    private string BuildBackgroundTaskStatusMessage()
+    {
+        if (_isImporting)
+        {
+            return LocalizationManager.Format(
+                "BackgroundTaskImportingFormat",
+                _currentImportSourceCount,
+                _currentImportTargetDisplayName);
+        }
+
+        if (_isSynchronizing)
+        {
+            return LocalizationManager.Get("BackgroundTaskSynchronizing");
+        }
+
+        if (_thumbnailLoadStatus.IsRunning)
+        {
+            return LocalizationManager.Format(
+                "BackgroundTaskLoadingThumbnailsFormat",
+                _thumbnailLoadStatus.CompletedCount,
+                _thumbnailLoadStatus.TotalCount);
+        }
+
+        return LocalizationManager.Get("BackgroundTaskIdle");
+    }
 }
 
-public sealed class AssetRow(AssetRecord asset, string fullPath)
+public sealed class AssetRow : INotifyPropertyChanged
 {
-    public Guid Id => asset.Id;
+    private readonly AssetRecord _asset;
+    private ThumbnailDisplaySettings _thumbnailDisplaySettings;
+    private Uri? _thumbnailImageUri;
 
-    public string DisplayName => asset.DisplayName;
+    public AssetRow(AssetRecord asset, string fullPath, ThumbnailDisplaySettings thumbnailDisplaySettings)
+    {
+        _asset = asset;
+        FullPath = fullPath;
+        _thumbnailDisplaySettings = thumbnailDisplaySettings;
+        ThumbnailFields = new ObservableCollection<ThumbnailFieldDisplay>();
+        RebuildThumbnailFields();
+    }
 
-    public string TypeText => FormatAssetType(asset.TypeId);
+    public Guid Id => _asset.Id;
 
-    public AssetStatus Status => asset.Status;
+    internal AssetRecord Asset => _asset;
 
-    public string StatusText => asset.Status switch
+    public string DisplayName => _asset.DisplayName;
+
+    public AssetStatus Status => _asset.Status;
+
+    public string StatusText => _asset.Status switch
     {
         AssetStatus.Available => LocalizationManager.Get("AssetStatusAvailable"),
         AssetStatus.Missing => LocalizationManager.Get("AssetStatusMissing"),
-        _ => asset.Status.ToString()
+        _ => _asset.Status.ToString()
     };
 
-    public string RelativePath => asset.LibraryRelativePath.Value;
+    public string RelativePath => _asset.LibraryRelativePath.Value;
 
-    public string FullPath { get; } = fullPath;
+    public string FullPath { get; }
 
-    public string Notes => asset.Notes;
+    public string Notes => _asset.Notes;
 
-    public string TagsText => string.Join(", ", asset.Tags);
+    public string TagsText => string.Join(", ", _asset.Tags);
 
-    public string SizeText => asset.SizeBytes switch
+    public string SizeText => _asset.SizeBytes switch
     {
-        < 1024 => asset.SizeBytes + " B",
-        < 1024 * 1024 => (asset.SizeBytes / 1024d).ToString("0.#") + " KB",
-        < 1024 * 1024 * 1024 => (asset.SizeBytes / 1024d / 1024d).ToString("0.#") + " MB",
-        _ => (asset.SizeBytes / 1024d / 1024d / 1024d).ToString("0.#") + " GB"
+        < 1024 => _asset.SizeBytes + " B",
+        < 1024 * 1024 => (_asset.SizeBytes / 1024d).ToString("0.#") + " KB",
+        < 1024 * 1024 * 1024 => (_asset.SizeBytes / 1024d / 1024d).ToString("0.#") + " MB",
+        _ => (_asset.SizeBytes / 1024d / 1024d / 1024d).ToString("0.#") + " GB"
     };
+
+    public string TypeText => FormatAssetType(_asset.TypeId);
+
+    public bool CanRequestThumbnail => _asset.TypeId == AssetTypeId.Image && _asset.Status == AssetStatus.Available;
+
+    public bool HasThumbnailImage => _thumbnailImageUri is not null;
+
+    public Uri? ThumbnailImageUri => _thumbnailImageUri;
+
+    public string PlaceholderText => _asset.Status == AssetStatus.Missing ? StatusText : TypeText;
+
+    public ObservableCollection<ThumbnailFieldDisplay> ThumbnailFields { get; }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public void ApplyThumbnailDisplaySettings(ThumbnailDisplaySettings settings)
+    {
+        _thumbnailDisplaySettings = settings;
+        RebuildThumbnailFields();
+    }
+
+    public void SetThumbnailPath(string thumbnailPath)
+    {
+        var nextThumbnailUri = string.IsNullOrWhiteSpace(thumbnailPath)
+            ? null
+            : new Uri(thumbnailPath);
+        if (_thumbnailImageUri == nextThumbnailUri)
+        {
+            return;
+        }
+
+        _thumbnailImageUri = nextThumbnailUri;
+        OnPropertyChanged(nameof(ThumbnailImageUri));
+        OnPropertyChanged(nameof(HasThumbnailImage));
+    }
+
+    private void RebuildThumbnailFields()
+    {
+        ThumbnailFields.Clear();
+
+        if (_thumbnailDisplaySettings.ShowType)
+        {
+            ThumbnailFields.Add(new ThumbnailFieldDisplay(
+                LocalizationManager.Get("AssetListTypeHeader"),
+                TypeText));
+        }
+
+        if (_thumbnailDisplaySettings.ShowStatus)
+        {
+            ThumbnailFields.Add(new ThumbnailFieldDisplay(
+                LocalizationManager.Get("AssetListStatusHeader"),
+                StatusText));
+        }
+
+        if (_thumbnailDisplaySettings.ShowTags && !string.IsNullOrWhiteSpace(TagsText))
+        {
+            ThumbnailFields.Add(new ThumbnailFieldDisplay(
+                LocalizationManager.Get("TagsLabel"),
+                TagsText));
+        }
+
+        if (_thumbnailDisplaySettings.ShowPath)
+        {
+            ThumbnailFields.Add(new ThumbnailFieldDisplay(
+                LocalizationManager.Get("AssetListPathHeader"),
+                RelativePath));
+        }
+
+        if (_thumbnailDisplaySettings.ShowSize)
+        {
+            ThumbnailFields.Add(new ThumbnailFieldDisplay(
+                LocalizationManager.Get("AssetListSizeHeader"),
+                SizeText));
+        }
+
+        OnPropertyChanged(nameof(ThumbnailFields));
+        OnPropertyChanged(nameof(TypeText));
+        OnPropertyChanged(nameof(StatusText));
+        OnPropertyChanged(nameof(PlaceholderText));
+    }
 
     private static string FormatAssetType(AssetTypeId typeId)
     {
@@ -758,6 +1294,11 @@ public sealed class AssetRow(AssetRecord asset, string fullPath)
             ? LocalizationManager.Get("AssetTypeUnknown")
             : typeId.Value;
     }
+
+    private void OnPropertyChanged(string propertyName)
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+    }
 }
 
 public sealed class KnownLibraryRow(KnownLibrary library)
@@ -767,18 +1308,4 @@ public sealed class KnownLibraryRow(KnownLibrary library)
     public string DisplayText => library.IsAvailable
         ? LocalizationManager.Format("KnownLibraryAvailableFormat", library.DisplayName, library.RootPath)
         : LocalizationManager.Format("KnownLibraryMissingFormat", library.DisplayName, library.RootPath);
-}
-
-public sealed class LibraryFolderRow
-{
-    public LibraryFolderRow(LibraryRelativePath relativePath)
-    {
-        RelativePath = relativePath;
-    }
-
-    public LibraryRelativePath RelativePath { get; }
-
-    public string DisplayName => RelativePath.IsRoot
-        ? LocalizationManager.Get("LibraryRootFolder")
-        : RelativePath.Value;
 }

@@ -1,6 +1,7 @@
 <Window x:Class="AssetManager.Desktop.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:AssetManager.Desktop"
         Title="{DynamicResource AppTitle}"
         Loaded="Window_Loaded"
         Width="1440"
@@ -27,6 +28,11 @@
         <Style TargetType="TextBlock">
             <Setter Property="TextWrapping" Value="Wrap" />
         </Style>
+        <Style TargetType="TreeViewItem">
+            <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+            <Setter Property="IsSelected" Value="{Binding IsSelected, Mode=TwoWay}" />
+            <Setter Property="Padding" Value="0,2,0,2" />
+        </Style>
     </Window.Resources>
 
     <DockPanel Margin="12" LastChildFill="True">
@@ -35,6 +41,7 @@
                 BorderBrush="#D6DCE5"
                 BorderThickness="1"
                 Padding="10"
+                IsEnabled="{Binding CanInteract}"
                 Margin="0,0,0,10">
             <DockPanel LastChildFill="True">
                 <WrapPanel DockPanel.Dock="Top" Margin="0,0,0,8">
@@ -61,6 +68,13 @@
                     <Button Content="{DynamicResource NewFolderButton}" Click="NewFolder_Click" />
                     <Button Content="{DynamicResource ImportFilesButton}" Click="ImportFiles_Click" />
                     <Button Content="{DynamicResource ImportFolderButton}" Click="ImportFolder_Click" />
+                    <CheckBox x:Name="LowImpactImportCheckBox"
+                              Content="{DynamicResource LowImpactImportLabel}"
+                              IsChecked="{Binding IsLowImpactImportEnabled, Mode=OneWay}"
+                              ToolTip="{DynamicResource LowImpactImportTooltip}"
+                              VerticalAlignment="Center"
+                              Margin="0,0,12,0"
+                              Click="LowImpactImportCheckBox_Click" />
                     <Button Content="{DynamicResource NewTextButton}" Click="NewText_Click" />
                     <Button Content="{DynamicResource SyncButton}" Click="Sync_Click" />
                     <Button Content="{DynamicResource CopyButton}" Click="CopySelection_Click" />
@@ -92,14 +106,32 @@
             </DockPanel>
         </Border>
 
-        <TextBlock DockPanel.Dock="Bottom"
+        <StatusBar DockPanel.Dock="Bottom"
                    Margin="0,10,0,0"
-                   Foreground="#475569"
-                   Text="{Binding StatusMessage}" />
+                   Background="White"
+                   BorderBrush="#D6DCE5"
+                   BorderThickness="1">
+            <StatusBarItem Padding="8,2">
+                <DockPanel LastChildFill="True">
+                    <TextBlock Text="{DynamicResource BackgroundTasksLabel}"
+                               FontWeight="SemiBold"
+                               Foreground="#334155"
+                               Margin="0,0,8,0" />
+                    <TextBlock Text="{Binding BackgroundTaskStatusMessage}"
+                               Foreground="#475569" />
+                </DockPanel>
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem HorizontalAlignment="Stretch">
+                <TextBlock Text="{Binding StatusMessage}"
+                           Foreground="#475569"
+                           TextTrimming="CharacterEllipsis" />
+            </StatusBarItem>
+        </StatusBar>
 
-        <Grid>
+        <Grid IsEnabled="{Binding CanInteract}">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="230" />
+                <ColumnDefinition Width="250" />
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="360" />
             </Grid.ColumnDefinitions>
@@ -114,11 +146,18 @@
                                Padding="10"
                                FontWeight="SemiBold"
                                Text="{DynamicResource FoldersHeader}" />
-                    <ListBox x:Name="FolderList"
-                             ItemsSource="{Binding Folders}"
-                             DisplayMemberPath="DisplayName"
-                             BorderThickness="0"
-                             SelectionChanged="FolderList_SelectionChanged" />
+                    <TreeView x:Name="FolderTree"
+                              ItemsSource="{Binding FolderRoots}"
+                              BorderThickness="0"
+                              Background="Transparent"
+                              SelectedItemChanged="FolderTree_SelectedItemChanged">
+                        <TreeView.Resources>
+                            <HierarchicalDataTemplate DataType="{x:Type local:LibraryFolderNode}"
+                                                      ItemsSource="{Binding Children}">
+                                <TextBlock Text="{Binding DisplayName}" />
+                            </HierarchicalDataTemplate>
+                        </TreeView.Resources>
+                    </TreeView>
                 </DockPanel>
             </Border>
 
@@ -130,25 +169,132 @@
                 <Grid AllowDrop="True"
                       Drop="AssetGrid_Drop"
                       DragOver="AssetGrid_DragOver">
-                    <ListView x:Name="AssetList"
-                              ItemsSource="{Binding Assets}"
-                              BorderThickness="0"
-                              Background="Transparent"
-                              SelectionMode="Extended"
-                              SelectionChanged="AssetList_SelectionChanged"
-                              PreviewMouseLeftButtonDown="AssetList_PreviewMouseLeftButtonDown"
-                              PreviewMouseMove="AssetList_PreviewMouseMove">
-                        <ListView.View>
-                            <GridView>
-                                <GridViewColumn Header="{DynamicResource AssetListNameHeader}" DisplayMemberBinding="{Binding DisplayName}" Width="190" />
-                                <GridViewColumn Header="{DynamicResource AssetListTypeHeader}" DisplayMemberBinding="{Binding TypeText}" Width="72" />
-                                <GridViewColumn Header="{DynamicResource AssetListStatusHeader}" DisplayMemberBinding="{Binding StatusText}" Width="78" />
-                                <GridViewColumn Header="{DynamicResource AssetListTagsHeader}" DisplayMemberBinding="{Binding TagsText}" Width="150" />
-                                <GridViewColumn Header="{DynamicResource AssetListPathHeader}" DisplayMemberBinding="{Binding RelativePath}" Width="310" />
-                                <GridViewColumn Header="{DynamicResource AssetListSizeHeader}" DisplayMemberBinding="{Binding SizeText}" Width="90" />
-                            </GridView>
-                        </ListView.View>
-                    </ListView>
+                    <DockPanel>
+                        <DockPanel DockPanel.Dock="Top"
+                                   Margin="12,12,12,8"
+                                   LastChildFill="False">
+                            <TextBlock Text="{DynamicResource ThumbnailViewHeader}"
+                                       FontWeight="SemiBold"
+                                       FontSize="14"
+                                       VerticalAlignment="Center" />
+                            <Button DockPanel.Dock="Right"
+                                    Content="{DynamicResource ThumbnailFieldsButton}"
+                                    MinWidth="120"
+                                    Click="ThumbnailFieldsButton_Click" />
+                        </DockPanel>
+
+                        <ListBox x:Name="AssetList"
+                                 ItemsSource="{Binding Assets}"
+                                 BorderThickness="0"
+                                 Background="Transparent"
+                                 ScrollViewer.CanContentScroll="True"
+                                 SelectionMode="Extended"
+                                 SelectionChanged="AssetList_SelectionChanged"
+                                 PreviewMouseLeftButtonDown="AssetList_PreviewMouseLeftButtonDown"
+                                 PreviewMouseMove="AssetList_PreviewMouseMove"
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                 ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                 VirtualizingPanel.IsVirtualizing="True"
+                                 VirtualizingPanel.VirtualizationMode="Recycling">
+                            <ListBox.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <local:VirtualizingTilePanel ItemWidth="222"
+                                                                 ItemHeight="298"
+                                                                 OverscanRows="1" />
+                                </ItemsPanelTemplate>
+                            </ListBox.ItemsPanel>
+                            <ListBox.ItemContainerStyle>
+                                <Style TargetType="ListBoxItem">
+                                    <Setter Property="Margin" Value="0,0,12,12" />
+                                    <Setter Property="Padding" Value="0" />
+                                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                    <Setter Property="VerticalContentAlignment" Value="Stretch" />
+                                    <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+                                </Style>
+                            </ListBox.ItemContainerStyle>
+                            <ListBox.ItemTemplate>
+                                <DataTemplate DataType="{x:Type local:AssetRow}">
+                                    <Border x:Name="CardBorder"
+                                            Width="210"
+                                            Height="286"
+                                            Background="#FCFDFE"
+                                            BorderBrush="#D6DCE5"
+                                            BorderThickness="1"
+                                            CornerRadius="6"
+                                            Padding="8">
+                                        <StackPanel>
+                                            <Border Height="132"
+                                                    Background="#E8EEF5"
+                                                    CornerRadius="4">
+                                                <Grid>
+                                                    <Image Source="{Binding ThumbnailImageUri}"
+                                                           Stretch="UniformToFill">
+                                                        <Image.Style>
+                                                            <Style TargetType="Image">
+                                                                <Setter Property="Visibility" Value="Collapsed" />
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding HasThumbnailImage}" Value="True">
+                                                                        <Setter Property="Visibility" Value="Visible" />
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </Image.Style>
+                                                    </Image>
+                                                    <Border Background="#DCE6F2"
+                                                            CornerRadius="4">
+                                                        <Border.Style>
+                                                            <Style TargetType="Border">
+                                                                <Setter Property="Visibility" Value="Visible" />
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding HasThumbnailImage}" Value="True">
+                                                                        <Setter Property="Visibility" Value="Collapsed" />
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </Border.Style>
+                                                        <TextBlock Text="{Binding PlaceholderText}"
+                                                                   HorizontalAlignment="Center"
+                                                                   VerticalAlignment="Center"
+                                                                   FontWeight="SemiBold"
+                                                                   Foreground="#334155"
+                                                                   TextAlignment="Center" />
+                                                    </Border>
+                                                </Grid>
+                                            </Border>
+
+                                            <TextBlock Text="{Binding DisplayName}"
+                                                       FontWeight="SemiBold"
+                                                       Margin="0,8,0,6"
+                                                       MaxHeight="42"
+                                                       TextTrimming="CharacterEllipsis" />
+
+                                            <ItemsControl ItemsSource="{Binding ThumbnailFields}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate DataType="{x:Type local:ThumbnailFieldDisplay}">
+                                                        <DockPanel Margin="0,0,0,3"
+                                                                   LastChildFill="True">
+                                                            <TextBlock DockPanel.Dock="Left"
+                                                                       Text="{Binding Label}"
+                                                                       Foreground="#64748B"
+                                                                       Margin="0,0,6,0" />
+                                                            <TextBlock Text="{Binding Value}"
+                                                                       TextTrimming="CharacterEllipsis" />
+                                                        </DockPanel>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </StackPanel>
+                                    </Border>
+                                    <DataTemplate.Triggers>
+                                        <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                                            <Setter TargetName="CardBorder" Property="BorderBrush" Value="#2563EB" />
+                                            <Setter TargetName="CardBorder" Property="Background" Value="#EFF6FF" />
+                                        </DataTrigger>
+                                    </DataTemplate.Triggers>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </DockPanel>
                 </Grid>
             </Border>
 
