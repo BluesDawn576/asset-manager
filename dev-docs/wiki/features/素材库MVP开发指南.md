@@ -1,7 +1,7 @@
 # 素材库 MVP 开发指南
 
 > 创建日期: 2026-06-08 15:01
-> 最后更新: 2026-06-08 16:31
+> 最后更新: 2026-06-08 17:57
 > 作者: Adsicmes
 
 ## 概述
@@ -12,7 +12,7 @@
 
 Domain 层位于 `src/AssetManager.Domain/Library/`，只表达素材库业务概念，不依赖 WPF、SQLite 或文件复制实现：
 
-- `LibraryLocation` 定义库根目录、`.asset-manager`、`asset-manager.db`、`logs` 和 `temp` 的固定路径。
+- `LibraryLocation` 定义库根目录、`.asset-manager`、`asset-manager.db`、`logs`、`temp` 和 `thumbnails` 的固定路径。
 - `LibraryRelativePath` 负责库内相对路径规范化，禁止根路径、`..` 穿越和指向 `.asset-manager`。
 - `AssetTypeId` 表示素材类型标识，内置值包括 `image`、`video`、`audio`、`text` 和 `unknown`。它是字符串值对象，不再把类型系统封死成枚举。
 - `AssetRecord` 表示素材记录，包含库内路径、源路径、类型标识、大小、时间、哈希、备注、状态和标签。
@@ -50,8 +50,9 @@ Desktop 层位于 `src/AssetManager.Desktop/`：
 - `Localization/LocalizationManager.cs` 管理 WPF 资源字典切换、当前 `CultureInfo` 和语言持久化。
 - `Localization/Strings.zh-CN.xaml`、`Localization/Strings.en-US.xaml` 保存桌面端用户可见文案。
 - `Localization/UiSettingsStore.cs` 把 UI 设置写入 `%LOCALAPPDATA%\AssetManager\ui-settings.json`。
+- `AssetThumbnailLoadCoordinator.cs` 按顺序后台加载当前列表需要的图片缩略图，避免一次性打满磁盘和解码开销。
 
-Windows 文件交互仍由 `src/AssetManager.Infrastructure.Windows/WindowsFileTransferService.cs` 提供。素材列表拖出和复制到剪贴板时传递真实库内文件路径，资源管理器和 QQ 继续接收标准 FileDrop 数据。
+Windows 文件交互和缩略图缓存由 `src/AssetManager.Infrastructure.Windows/` 提供。`WindowsFileTransferService.cs` 负责素材列表拖出和剪贴板 FileDrop；`WindowsThumbnailCacheService.cs` 负责把图片缩略图缓存到 `.asset-manager/thumbnails/`，卡片列表优先显示缓存图而不是直接打开原图。
 
 插件相关项目当前只落地了最小架构骨架，还没有动态加载、权限隔离或进程外执行：
 
@@ -133,6 +134,16 @@ WPF UI 使用 `Preview/IAssetPreviewRenderer.cs` 管线渲染预览。内置 ren
 
 插件系统接入后，扩展预览能力应优先通过“类型 resolver + preview renderer”组合完成。插件可以贡献新的 type id 和对应 renderer；插件不应该直接改 `SqliteAssetLibraryRepository`，也不应该让 Domain 知道某个插件文件类型。
 
+## 缩略图缓存规则
+
+图片卡片缩略图是后台生成的显示缓存，不是素材源文件的一部分。当前规则如下：
+
+- 缩略图只缓存到 `.asset-manager/thumbnails/`，不写回素材目录。
+- 当前仅对 `image` 类型生成磁盘缓存；视频、音频和文本仍使用占位卡片。
+- 缩略图文件名按素材 `content_hash` 组织，重复内容可复用同一缓存图。
+- `MainWindow` 刷新素材列表后，会通过 `AssetThumbnailLoadCoordinator` 顺序请求缓存，避免一次性并发读取大量原图。
+- 如果图片解码失败或格式当前无法生成缩略图，卡片继续显示类型占位，不影响素材记录和预览能力。
+
 ## 验证命令
 
 完整构建：
@@ -181,6 +192,7 @@ dotnet test .\AssetManager.sln
 - 新增预览能力时，优先增加 `IAssetPreviewRenderer` 实现并由 `DesktopBootstrapper` 或插件 Host 注入 renderer 列表，不要把新的 switch 分支写回 `MainWindow`。
 - 修改项目引用关系时，同步运行架构边界测试，确认 Domain/Application 依赖方向没有倒灌。
 - 修改拖出或剪贴板行为时，优先检查 `WindowsFileTransferService.CreateFileDropDataObject()` 和 `WindowsFileTransferService.CopyToClipboard()`。
+- 修改缩略图卡片加载行为时，优先检查 `WindowsThumbnailCacheService`、`AssetThumbnailLoadCoordinator` 和 `AssetRow.SetThumbnailPath()`，避免重新把列表绑定回原图路径。
 
 ## 相关文档
 
@@ -202,3 +214,4 @@ dotnet test .\AssetManager.sln
 | 2026-06-08 15:44 | Adsicmes | 补充国际化资源引用测试说明 |
 | 2026-06-08 16:31 | Adsicmes | 补充架构修复后的 AssetTypeId、类型 resolver、预览 renderer 和边界测试规则 |
 | 2026-06-08 16:31 | Adsicmes | 补充插件最小契约、SDK 基类和注册表说明 |
+| 2026-06-08 17:57 | Adsicmes | 补充图片缩略图缓存目录、后台加载队列和卡片显示规则 |
