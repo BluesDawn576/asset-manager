@@ -2,7 +2,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\AssetManager.Domain\AssetManager.Domain.csproj" />
-    <ProjectReference Include="..\AssetManager.Plugin.Abstractions\AssetManager.Plugin.Abstractions.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
