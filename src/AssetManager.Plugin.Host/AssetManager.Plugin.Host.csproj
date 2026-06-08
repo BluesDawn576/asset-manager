@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\AssetManager.Application\AssetManager.Application.csproj" />
+    <ProjectReference Include="..\AssetManager.Plugin.Abstractions\AssetManager.Plugin.Abstractions.csproj" />
+    <ProjectReference Include="..\AssetManager.Plugin.Sdk\AssetManager.Plugin.Sdk.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
