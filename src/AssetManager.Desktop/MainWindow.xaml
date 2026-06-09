@@ -118,7 +118,14 @@
                                Foreground="#334155"
                                Margin="0,0,8,0" />
                     <TextBlock Text="{Binding BackgroundTaskStatusMessage}"
-                               Foreground="#475569" />
+                               Foreground="#475569"
+                               TextTrimming="CharacterEllipsis"
+                               Margin="0,0,8,0" />
+                    <Button Content="{DynamicResource BackgroundTasksButton}"
+                            MinWidth="92"
+                            Padding="10,2"
+                            Margin="0"
+                            Click="BackgroundTasks_Click" />
                 </DockPanel>
             </StatusBarItem>
             <Separator />

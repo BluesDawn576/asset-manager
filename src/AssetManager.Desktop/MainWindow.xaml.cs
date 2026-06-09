@@ -1,10 +1,14 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Threading;
+using AssetManager.Application.BackgroundTasks;
 using AssetManager.Application.Library;
 using AssetManager.Desktop.Localization;
 using AssetManager.Desktop.Preview;
@@ -20,7 +24,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private readonly KnownLibraryApplicationService _knownLibraryService;
     private readonly AssetPreviewPresenter _previewPresenter;
     private readonly UiSettingsStore _uiSettingsStore;
+    private readonly IBackgroundTaskCenter _backgroundTaskCenter;
     private readonly AssetThumbnailLoadCoordinator _thumbnailLoadCoordinator;
+    private readonly LibraryFileSystemChangeMonitor _libraryChangeMonitor;
 
     private LibraryLocation? _libraryLocation;
     private LibraryRelativePath _currentFolder = LibraryRelativePath.Root;
@@ -28,31 +34,42 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private string _statusMessage = string.Empty;
     private string _libraryRootMessage = string.Empty;
     private string _currentFolderMessage = string.Empty;
-    private string _currentImportTargetDisplayName = string.Empty;
     private bool _isSelectingFolder;
     private bool _isRefreshingKnownLibraries;
     private bool _isChangingLanguage;
-    private bool _isImporting;
-    private bool _isSynchronizing;
+    private bool _isBusy;
     private bool _isLowImpactImportEnabled;
-    private int _currentImportSourceCount;
     private ThumbnailDisplaySettings _thumbnailDisplaySettings = ThumbnailDisplaySettings.Default;
-    private ThumbnailLoadStatus _thumbnailLoadStatus = ThumbnailLoadStatus.Idle;
+    private IReadOnlyList<BackgroundTaskSnapshot> _backgroundTaskSnapshots = [];
+    private BackgroundTasksWindow? _backgroundTasksWindow;
+    private int _backgroundTaskRefreshQueued;
+    private long _backgroundTaskSnapshotVersion;
+    private long _lastAppliedBackgroundTaskSnapshotVersion;
+    private bool _autoSyncQueued;
+    private readonly HashSet<string> _pendingAutoSyncPaths = new(StringComparer.OrdinalIgnoreCase);
 
     public MainWindow(
         LibraryApplicationService libraryService,
         KnownLibraryApplicationService knownLibraryService,
         IReadOnlyList<IAssetPreviewRenderer> previewRenderers,
         UiSettingsStore uiSettingsStore,
-        WindowsThumbnailCacheService thumbnailCacheService)
+        WindowsThumbnailCacheService thumbnailCacheService,
+        IBackgroundTaskCenter backgroundTaskCenter)
     {
         _libraryService = libraryService;
         _knownLibraryService = knownLibraryService;
         _uiSettingsStore = uiSettingsStore;
+        _backgroundTaskCenter = backgroundTaskCenter;
 
         InitializeComponent();
-        _thumbnailLoadCoordinator = new AssetThumbnailLoadCoordinator(thumbnailCacheService, Dispatcher);
-        _thumbnailLoadCoordinator.StatusChanged += OnThumbnailLoadStatusChanged;
+        _thumbnailLoadCoordinator = new AssetThumbnailLoadCoordinator(
+            thumbnailCacheService,
+            backgroundTaskCenter,
+            Dispatcher);
+        _libraryChangeMonitor = new LibraryFileSystemChangeMonitor(
+            Dispatcher,
+            QueueAutomaticSynchronization);
+        _backgroundTaskCenter.SnapshotsChanged += OnBackgroundTaskSnapshotsChanged;
         _previewPresenter = new AssetPreviewPresenter(
             previewRenderers,
             new PreviewSurface(
@@ -72,6 +89,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         StatusMessage = LocalizationManager.Get("StatusRegisterOrSelectLibrary");
         UpdateLibraryRootMessage();
         UpdateCurrentFolderMessage();
+        _backgroundTaskSnapshots = _backgroundTaskCenter.GetSnapshots();
+        SyncBackgroundTaskRows(_backgroundTaskSnapshots);
     }
 
     public ObservableCollection<LanguageOption> LanguageOptions { get; } = new();
@@ -82,7 +101,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     public ObservableCollection<LibraryFolderNode> FolderRoots { get; } = new();
 
-    public bool CanInteract => !_isImporting;
+    public ObservableCollection<BackgroundTaskRow> BackgroundTasks { get; } = new();
+
+    public bool CanInteract => !_isBusy;
 
     public string BackgroundTaskStatusMessage => BuildBackgroundTaskStatusMessage();
 
@@ -150,7 +171,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     protected override void OnClosed(EventArgs e)
     {
-        _thumbnailLoadCoordinator.StatusChanged -= OnThumbnailLoadStatusChanged;
+        _backgroundTaskCenter.SnapshotsChanged -= OnBackgroundTaskSnapshotsChanged;
+        if (_backgroundTasksWindow is not null)
+        {
+            _backgroundTasksWindow.Close();
+            _backgroundTasksWindow = null;
+        }
+
+        _libraryChangeMonitor.Dispose();
         _thumbnailLoadCoordinator.Dispose();
         base.OnClosed(e);
     }
@@ -182,6 +210,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 UpdateLibraryRootMessage();
             }
 
+            RefreshBackgroundTaskPresentation();
             OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
             StatusMessage = LocalizationManager.Get("StatusLanguageChanged");
         });
@@ -345,31 +374,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void Sync_Click(object sender, RoutedEventArgs e)
     {
-        if (!TryGetLibrary(out var location))
-        {
-            return;
-        }
-
-        await RunUiAsync(async () =>
-        {
-            SetSynchronizing(true);
-            try
-            {
-                var result = await _libraryService.SynchronizeAsync(location);
-                await RefreshFoldersAsync(_currentFolder);
-                await RefreshAssetsAsync();
-                StatusMessage = LocalizationManager.Format(
-                    "StatusSyncCompleteFormat",
-                    result.UpdatedCount,
-                    result.MovedCount,
-                    result.MissingCount,
-                    result.NewAssetCount);
-            }
-            finally
-            {
-                SetSynchronizing(false);
-            }
-        });
+        await RunUiAsync(() => RunSynchronizeAsync(allowQueueWhenBusy: false));
     }
 
     private async void Search_Click(object sender, RoutedEventArgs e)
@@ -464,6 +469,29 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         });
     }
 
+    private void BackgroundTasks_Click(object sender, RoutedEventArgs e)
+    {
+        if (_backgroundTasksWindow is null)
+        {
+            _backgroundTasksWindow = new BackgroundTasksWindow(
+                BackgroundTasks,
+                taskId => _backgroundTaskCenter.RequestCancel(taskId))
+            {
+                Owner = this
+            };
+            _backgroundTasksWindow.Closed += BackgroundTasksWindow_Closed;
+            _backgroundTasksWindow.Show();
+            return;
+        }
+
+        if (!_backgroundTasksWindow.IsVisible)
+        {
+            _backgroundTasksWindow.Show();
+        }
+
+        _backgroundTasksWindow.Activate();
+    }
+
     private void AssetGrid_DragOver(object sender, DragEventArgs e)
     {
         e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) && _libraryLocation is not null
@@ -549,7 +577,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        if (_isImporting)
+        if (_isBusy)
         {
             return;
         }
@@ -562,18 +590,48 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         var targetFolder = _currentFolder;
+        var currentImportStatus = LocalizationManager.Format(
+            "BackgroundTaskImportPreparingFormat",
+            FormatFolderName(targetFolder));
+        var session = _backgroundTaskCenter.StartTask(
+            new BackgroundTaskStartRequest(
+                BackgroundTaskKind.ImportAssets,
+                LocalizationManager.Get("BackgroundTaskImportTitle"),
+                currentImportStatus,
+                IsCancelable: true,
+                InitialProgress: BackgroundTaskProgress.None));
+        var progress = new Progress<AssetImportProgress>(value =>
+        {
+            currentImportStatus = BuildImportTaskStatus(value);
+            session.Update(
+                currentImportStatus,
+                BuildImportTaskProgress(value));
+        });
         var importOptions = IsLowImpactImportEnabled
-            ? AssetImportOptions.LowImpact
-            : AssetImportOptions.Default;
-        SetImporting(true, normalizedPaths.Length, FormatFolderName(targetFolder));
+            ? AssetImportOptions.LowImpact with { Progress = progress }
+            : AssetImportOptions.Default with { Progress = progress };
+        using var changeSuppression = _libraryChangeMonitor.SuppressChanges();
+
+        SetBusy(true);
         StatusMessage = LocalizationManager.Format(
             "StatusImportingIntoFormat",
             FormatFolderName(targetFolder));
 
         try
         {
-            var result = await Task.Run(() =>
-                _libraryService.ImportPathsAsync(location, targetFolder, normalizedPaths, importOptions));
+            var result = await Task.Run(
+                () => _libraryService.ImportPathsAsync(
+                    location,
+                    targetFolder,
+                    normalizedPaths,
+                    importOptions,
+                    session.CancellationToken),
+                session.CancellationToken);
+
+            session.Complete(LocalizationManager.Format(
+                "BackgroundTaskImportCompletedFormat",
+                result.ImportedCount,
+                FormatFolderName(targetFolder)));
 
             ApplyImportedFoldersIncrementally(result.ImportedFolders, targetFolder);
 
@@ -594,13 +652,25 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 result.ImportedCount,
                 FormatFolderName(targetFolder));
         }
+        catch (OperationCanceledException)
+        {
+            session.Cancel(LocalizationManager.Get("BackgroundTaskImportCanceled"));
+            StatusMessage = LocalizationManager.Get("BackgroundTaskImportCanceled");
+        }
         catch (Exception ex)
         {
+            session.Fail(
+                ex,
+                LocalizationManager.Format(
+                    "BackgroundTaskImportFailedAtFormat",
+                    currentImportStatus,
+                    ex.Message));
             StatusMessage = ex.Message;
         }
         finally
         {
-            SetImporting(false);
+            session.Dispose();
+            SetBusy(false);
         }
     }
 
@@ -766,6 +836,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         _libraryLocation = session.Location;
         _currentFolder = session.CurrentFolder;
+        _autoSyncQueued = false;
+        _libraryChangeMonitor.Start(session.Location);
         UpdateLibraryRootMessage();
         await RefreshFoldersAsync(_currentFolder);
         await RefreshAssetsAsync();
@@ -850,16 +922,80 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
         }
 
+        var insertedRows = new List<AssetRow>();
         for (var index = visibleAssets.Length - 1; index >= 0; index--)
         {
-            Assets.Insert(0, new AssetRow(
+            var row = new AssetRow(
                 visibleAssets[index],
                 visibleAssets[index].FullPath(_libraryLocation),
-                _thumbnailDisplaySettings));
+                _thumbnailDisplaySettings);
+            Assets.Insert(0, row);
+            insertedRows.Add(row);
         }
 
         AssetList.SelectedItem = Assets.FirstOrDefault(asset => asset.Id == visibleAssets[0].Id);
-        ScheduleThumbnailLoading();
+        ScheduleThumbnailLoading(insertedRows);
+    }
+
+    private void ApplySynchronizedAssetsIncrementally(LibrarySyncResult result)
+    {
+        if (_libraryLocation is null)
+        {
+            return;
+        }
+
+        var selectedAssetId = (AssetList.SelectedItem as AssetRow)?.Id;
+        var removedAssetIds = (result.RemovedAssetIds ?? [])
+            .ToHashSet();
+        for (var index = Assets.Count - 1; index >= 0; index--)
+        {
+            if (removedAssetIds.Contains(Assets[index].Id))
+            {
+                Assets.RemoveAt(index);
+            }
+        }
+
+        var changedRows = new List<AssetRow>();
+        foreach (var asset in result.AffectedAssets ?? [])
+        {
+            var existingIndex = FindAssetRowIndex(asset.Id);
+            if (!IsVisibleInCurrentFolder(asset, _currentFolder))
+            {
+                if (existingIndex >= 0)
+                {
+                    Assets.RemoveAt(existingIndex);
+                }
+
+                continue;
+            }
+
+            var row = new AssetRow(asset, asset.FullPath(_libraryLocation), _thumbnailDisplaySettings);
+            if (existingIndex >= 0)
+            {
+                Assets[existingIndex] = row;
+            }
+            else
+            {
+                InsertAssetRow(row);
+            }
+
+            changedRows.Add(row);
+        }
+
+        if (selectedAssetId is not null)
+        {
+            AssetList.SelectedItem = Assets.FirstOrDefault(asset => asset.Id == selectedAssetId.Value);
+        }
+
+        if (AssetList.SelectedItem is null)
+        {
+            ClearDetails();
+        }
+
+        if (changedRows.Count > 0)
+        {
+            ScheduleThumbnailLoading(changedRows);
+        }
     }
 
     private IReadOnlyList<string> ParseTagFilter()
@@ -874,7 +1010,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return !string.IsNullOrWhiteSpace(SearchBox.Text) || ParseTagFilter().Count > 0;
     }
 
-    private void ScheduleThumbnailLoading()
+    private void ScheduleThumbnailLoading(IEnumerable<AssetRow>? rows = null)
     {
         if (_libraryLocation is null)
         {
@@ -882,51 +1018,182 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
 
-        _thumbnailLoadCoordinator.Reload(_libraryLocation, Assets);
+        _thumbnailLoadCoordinator.Reload(_libraryLocation, rows ?? Assets);
     }
 
-    private void SetImporting(
-        bool isImporting,
-        int sourceCount = 0,
-        string? targetDisplayName = null)
+    private void SetBusy(bool isBusy)
     {
-        if (_isImporting == isImporting)
+        if (_isBusy == isBusy)
         {
-            if (isImporting)
+            return;
+        }
+
+        _isBusy = isBusy;
+        OnPropertyChanged(nameof(CanInteract));
+        if (!_isBusy && _autoSyncQueued)
+        {
+            var changedPaths = ConsumePendingAutoSyncPaths();
+            _ = Dispatcher.InvokeAsync(
+                () => _ = RunUiAsync(() => RunSynchronizeAsync(allowQueueWhenBusy: true, changedPaths)),
+                DispatcherPriority.Background);
+        }
+    }
+
+    private void QueueAutomaticSynchronization(IReadOnlyList<string> changedPaths)
+    {
+        if (_libraryLocation is null)
+        {
+            return;
+        }
+
+        AddPendingAutoSyncPaths(changedPaths);
+        _autoSyncQueued = true;
+        StatusMessage = LocalizationManager.Get("StatusAutoSyncQueued");
+        if (_isBusy)
+        {
+            return;
+        }
+
+        var queuedPaths = ConsumePendingAutoSyncPaths();
+        _ = RunUiAsync(() => RunSynchronizeAsync(allowQueueWhenBusy: true, queuedPaths));
+    }
+
+    private async Task RunSynchronizeAsync(
+        bool allowQueueWhenBusy,
+        IReadOnlyList<string>? changedPaths = null)
+    {
+        if (!TryGetLibrary(out var location))
+        {
+            return;
+        }
+
+        if (changedPaths is { Count: 0 })
+        {
+            return;
+        }
+
+        if (_isBusy)
+        {
+            _autoSyncQueued = allowQueueWhenBusy || _autoSyncQueued;
+            if (allowQueueWhenBusy && changedPaths is not null)
             {
-                _currentImportSourceCount = sourceCount;
-                _currentImportTargetDisplayName = targetDisplayName ?? string.Empty;
-                OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+                AddPendingAutoSyncPaths(changedPaths);
             }
 
             return;
         }
 
-        _isImporting = isImporting;
-        if (isImporting)
+        var isIncremental = changedPaths is { Count: > 0 };
+        if (!isIncremental)
         {
-            _currentImportSourceCount = sourceCount;
-            _currentImportTargetDisplayName = targetDisplayName ?? string.Empty;
-        }
-        else
-        {
-            _currentImportSourceCount = 0;
-            _currentImportTargetDisplayName = string.Empty;
+            _autoSyncQueued = false;
         }
 
-        OnPropertyChanged(nameof(CanInteract));
-        OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+        var currentSyncStatus = LocalizationManager.Get("BackgroundTaskSyncScanning");
+        var session = _backgroundTaskCenter.StartTask(
+            new BackgroundTaskStartRequest(
+                BackgroundTaskKind.SynchronizeLibrary,
+                LocalizationManager.Get("BackgroundTaskSyncTitle"),
+                currentSyncStatus,
+                IsCancelable: true,
+                InitialProgress: BackgroundTaskProgress.None));
+        SetBusy(true);
+
+        try
+        {
+            var syncProgress = new Progress<LibrarySyncProgress>(progress =>
+            {
+                currentSyncStatus = BuildSyncTaskStatus(progress);
+                session.Update(
+                    currentSyncStatus,
+                    BuildSyncTaskProgress(progress));
+            });
+
+            var result = await Task.Run(
+                () => isIncremental
+                    ? _libraryService.SynchronizePathsAsync(
+                        location,
+                        changedPaths!,
+                        syncProgress,
+                        session.CancellationToken)
+                    : _libraryService.SynchronizeAsync(
+                        location,
+                        syncProgress,
+                        session.CancellationToken),
+                session.CancellationToken);
+
+            session.Complete(LocalizationManager.Format(
+                "BackgroundTaskSyncCompletedFormat",
+                result.UpdatedCount,
+                    result.MovedCount,
+                    result.MissingCount,
+                    result.NewAssetCount));
+            await RefreshFoldersAsync(_currentFolder);
+            if (isIncremental && !HasActiveAssetFilter())
+            {
+                ApplySynchronizedAssetsIncrementally(result);
+            }
+            else
+            {
+                await RefreshAssetsAsync();
+            }
+
+            StatusMessage = LocalizationManager.Format(
+                "StatusSyncCompleteFormat",
+                result.UpdatedCount,
+                result.MovedCount,
+                result.MissingCount,
+                result.NewAssetCount);
+        }
+        catch (OperationCanceledException)
+        {
+            session.Cancel(LocalizationManager.Get("BackgroundTaskSyncCanceled"));
+            StatusMessage = LocalizationManager.Get("BackgroundTaskSyncCanceled");
+        }
+        catch (Exception ex)
+        {
+            session.Fail(
+                ex,
+                LocalizationManager.Format(
+                    "BackgroundTaskSyncFailedAtFormat",
+                    currentSyncStatus,
+                    ex.Message));
+            StatusMessage = ex.Message;
+        }
+        finally
+        {
+            session.Dispose();
+            SetBusy(false);
+        }
     }
 
-    private void SetSynchronizing(bool isSynchronizing)
+    private void AddPendingAutoSyncPaths(IEnumerable<string> changedPaths)
     {
-        if (_isSynchronizing == isSynchronizing)
+        foreach (var path in changedPaths)
         {
-            return;
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                _pendingAutoSyncPaths.Add(path);
+            }
+        }
+    }
+
+    private IReadOnlyList<string> ConsumePendingAutoSyncPaths()
+    {
+        var paths = _pendingAutoSyncPaths.ToArray();
+        _pendingAutoSyncPaths.Clear();
+        _autoSyncQueued = false;
+        return paths;
+    }
+
+    private void BackgroundTasksWindow_Closed(object? sender, EventArgs e)
+    {
+        if (_backgroundTasksWindow is not null)
+        {
+            _backgroundTasksWindow.Closed -= BackgroundTasksWindow_Closed;
         }
 
-        _isSynchronizing = isSynchronizing;
-        OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+        _backgroundTasksWindow = null;
     }
 
     private static string[] NormalizeImportPaths(IEnumerable<string> paths)
@@ -951,6 +1218,44 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                || asset.LibraryRelativePath.Value.StartsWith(
                    currentFolder.Value + "/",
                    StringComparison.OrdinalIgnoreCase);
+    }
+
+    private int FindAssetRowIndex(Guid assetId)
+    {
+        for (var index = 0; index < Assets.Count; index++)
+        {
+            if (Assets[index].Id == assetId)
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    private void InsertAssetRow(AssetRow row)
+    {
+        var insertAt = 0;
+        while (insertAt < Assets.Count)
+        {
+            var importedAtComparison = DateTimeOffset.Compare(
+                row.ImportedAt,
+                Assets[insertAt].ImportedAt);
+            if (importedAtComparison > 0)
+            {
+                break;
+            }
+
+            if (importedAtComparison == 0
+                && StringComparer.OrdinalIgnoreCase.Compare(row.DisplayName, Assets[insertAt].DisplayName) < 0)
+            {
+                break;
+            }
+
+            insertAt++;
+        }
+
+        Assets.Insert(insertAt, row);
     }
 
     private static LibraryFolderNode BuildFolderTree(IReadOnlyList<LibraryFolder> folders)
@@ -1076,10 +1381,100 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 
-    private void OnThumbnailLoadStatusChanged(ThumbnailLoadStatus status)
+    private void OnBackgroundTaskSnapshotsChanged(IReadOnlyList<BackgroundTaskSnapshot> snapshots)
     {
-        _thumbnailLoadStatus = status;
+        _backgroundTaskSnapshots = snapshots.ToArray();
+        Interlocked.Increment(ref _backgroundTaskSnapshotVersion);
+        QueueBackgroundTaskRefresh();
+    }
+
+    private void QueueBackgroundTaskRefresh()
+    {
+        if (Interlocked.Exchange(ref _backgroundTaskRefreshQueued, 1) == 1)
+        {
+            return;
+        }
+
+        _ = Dispatcher.InvokeAsync(ApplyBackgroundTaskSnapshots, DispatcherPriority.Background);
+    }
+
+    private void ApplyBackgroundTaskSnapshots()
+    {
+        try
+        {
+            while (true)
+            {
+                var version = Interlocked.Read(ref _backgroundTaskSnapshotVersion);
+                if (version == _lastAppliedBackgroundTaskSnapshotVersion)
+                {
+                    break;
+                }
+
+                _lastAppliedBackgroundTaskSnapshotVersion = version;
+                SyncBackgroundTaskRows(_backgroundTaskSnapshots);
+                OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _backgroundTaskRefreshQueued, 0);
+            if (Interlocked.Read(ref _backgroundTaskSnapshotVersion) != _lastAppliedBackgroundTaskSnapshotVersion)
+            {
+                QueueBackgroundTaskRefresh();
+            }
+        }
+    }
+
+    private void RefreshBackgroundTaskPresentation()
+    {
+        SyncBackgroundTaskRows(_backgroundTaskSnapshots);
         OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+    }
+
+    private void SyncBackgroundTaskRows(IReadOnlyList<BackgroundTaskSnapshot> snapshots)
+    {
+        var orderedSnapshots = BackgroundTaskPresentation.OrderForDisplay(snapshots);
+        var snapshotIds = orderedSnapshots
+            .Select(snapshot => snapshot.Id)
+            .ToHashSet();
+        for (var index = BackgroundTasks.Count - 1; index >= 0; index--)
+        {
+            if (!snapshotIds.Contains(BackgroundTasks[index].Id))
+            {
+                BackgroundTasks.RemoveAt(index);
+            }
+        }
+
+        for (var index = 0; index < orderedSnapshots.Count; index++)
+        {
+            var snapshot = orderedSnapshots[index];
+            var existingIndex = FindBackgroundTaskRowIndex(snapshot.Id);
+            if (existingIndex < 0)
+            {
+                BackgroundTasks.Insert(index, new BackgroundTaskRow(snapshot));
+                continue;
+            }
+
+            var row = BackgroundTasks[existingIndex];
+            row.Apply(snapshot);
+            if (existingIndex != index)
+            {
+                BackgroundTasks.Move(existingIndex, index);
+            }
+        }
+    }
+
+    private int FindBackgroundTaskRowIndex(Guid taskId)
+    {
+        for (var index = 0; index < BackgroundTasks.Count; index++)
+        {
+            if (BackgroundTasks[index].Id == taskId)
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     private void SelectCurrentLanguage()
@@ -1115,30 +1510,86 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return folder.IsRoot ? LocalizationManager.Get("LibraryRootFolder") : folder.Value;
     }
 
+    private static BackgroundTaskProgress BuildImportTaskProgress(AssetImportProgress progress)
+    {
+        var totalFiles = Math.Max(progress.DiscoveredFiles, progress.CopiedFiles);
+        return new BackgroundTaskProgress(
+            progress.CopiedFiles,
+            totalFiles,
+            LocalizationManager.Get("BackgroundTaskProgressUnitFiles"));
+    }
+
+    private static string BuildImportTaskStatus(AssetImportProgress progress)
+    {
+        var totalFiles = Math.Max(progress.DiscoveredFiles, progress.CopiedFiles);
+        var currentItemName = string.IsNullOrWhiteSpace(progress.CurrentItemName)
+            ? "-"
+            : progress.CurrentItemName;
+
+        return LocalizationManager.Format(
+            "BackgroundTaskImportCopyingFormat",
+            progress.CopiedFiles,
+            totalFiles,
+            currentItemName);
+    }
+
+    private static BackgroundTaskProgress BuildSyncTaskProgress(LibrarySyncProgress progress)
+    {
+        return progress.Stage switch
+        {
+            LibrarySyncStage.ReconcilingAssets when progress.TotalAssets is > 0 => new BackgroundTaskProgress(
+                progress.ProcessedAssets,
+                progress.TotalAssets,
+                LocalizationManager.Get("BackgroundTaskProgressUnitAssets")),
+            LibrarySyncStage.Completed when progress.TotalAssets is > 0 => new BackgroundTaskProgress(
+                progress.ProcessedAssets,
+                progress.TotalAssets,
+                LocalizationManager.Get("BackgroundTaskProgressUnitAssets")),
+            _ => BackgroundTaskProgress.None
+        };
+    }
+
+    private static string BuildSyncTaskStatus(LibrarySyncProgress progress)
+    {
+        return progress.Stage switch
+        {
+            LibrarySyncStage.ScanningFiles => LocalizationManager.Get("BackgroundTaskSyncScanning"),
+            LibrarySyncStage.ReconcilingAssets when progress.TotalAssets is > 0 => LocalizationManager.Format(
+                "BackgroundTaskSyncReconcilingFormat",
+                progress.ProcessedAssets,
+                progress.TotalAssets.Value),
+            LibrarySyncStage.ReconcilingAssets => LocalizationManager.Get("BackgroundTaskSyncReconciling"),
+            LibrarySyncStage.RegisteringNewAssets => LocalizationManager.Format(
+                "BackgroundTaskSyncRegisteringFormat",
+                progress.NewAssetCount),
+            LibrarySyncStage.Completed => LocalizationManager.Format(
+                "BackgroundTaskSyncCompletedFormat",
+                progress.UpdatedCount,
+                progress.MovedCount,
+                progress.MissingCount,
+                progress.NewAssetCount),
+            _ => LocalizationManager.Get("BackgroundTaskSyncScanning")
+        };
+    }
+
     private string BuildBackgroundTaskStatusMessage()
     {
-        if (_isImporting)
+        var primaryTask = BackgroundTaskPresentation.SelectSummaryTask(_backgroundTaskSnapshots);
+        if (primaryTask is null)
+        {
+            return LocalizationManager.Get("BackgroundTaskIdle");
+        }
+
+        var runningCount = _backgroundTaskSnapshots.Count(snapshot => snapshot.State == BackgroundTaskState.Running);
+        if (runningCount > 1 && primaryTask.State == BackgroundTaskState.Running)
         {
             return LocalizationManager.Format(
-                "BackgroundTaskImportingFormat",
-                _currentImportSourceCount,
-                _currentImportTargetDisplayName);
+                "BackgroundTaskRunningMoreFormat",
+                primaryTask.StatusText,
+                runningCount - 1);
         }
 
-        if (_isSynchronizing)
-        {
-            return LocalizationManager.Get("BackgroundTaskSynchronizing");
-        }
-
-        if (_thumbnailLoadStatus.IsRunning)
-        {
-            return LocalizationManager.Format(
-                "BackgroundTaskLoadingThumbnailsFormat",
-                _thumbnailLoadStatus.CompletedCount,
-                _thumbnailLoadStatus.TotalCount);
-        }
-
-        return LocalizationManager.Get("BackgroundTaskIdle");
+        return primaryTask.StatusText;
     }
 }
 
@@ -1162,6 +1613,8 @@ public sealed class AssetRow : INotifyPropertyChanged
     internal AssetRecord Asset => _asset;
 
     public string DisplayName => _asset.DisplayName;
+
+    public DateTimeOffset ImportedAt => _asset.ImportedAt;
 
     public AssetStatus Status => _asset.Status;
 
