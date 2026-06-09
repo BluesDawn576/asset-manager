@@ -263,6 +263,69 @@ public sealed partial class SqliteAssetLibraryRepository : IAssetLibraryReposito
         return assets.SingleOrDefault();
     }
 
+    public async Task<IReadOnlyList<AssetRecord>> GetByRelativePathsAsync(
+        LibraryLocation location,
+        IEnumerable<LibraryRelativePath> paths,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedPaths = paths
+            .Select(path => path.Value)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (normalizedPaths.Length == 0)
+        {
+            return [];
+        }
+
+        await using var connection = await OpenConnectionAsync(location, cancellationToken);
+        await using var command = connection.CreateCommand();
+        var clauses = new List<string>();
+        for (var index = 0; index < normalizedPaths.Length; index++)
+        {
+            var parameterName = "$path" + index.ToString(CultureInfo.InvariantCulture);
+            clauses.Add("a.library_relative_path = " + parameterName);
+            command.Parameters.AddWithValue(parameterName, normalizedPaths[index]);
+        }
+
+        command.CommandText = BuildAssetSelectSql(string.Join(" OR ", clauses));
+        return await ReadAssetsAsync(command, cancellationToken);
+    }
+
+    public async Task<IReadOnlyList<AssetRecord>> GetByRelativePathPrefixesAsync(
+        LibraryLocation location,
+        IEnumerable<LibraryRelativePath> paths,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedPaths = paths
+            .DistinctBy(path => path.Value, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (normalizedPaths.Length == 0)
+        {
+            return [];
+        }
+
+        await using var connection = await OpenConnectionAsync(location, cancellationToken);
+        await using var command = connection.CreateCommand();
+        var clauses = new List<string>();
+        for (var index = 0; index < normalizedPaths.Length; index++)
+        {
+            if (normalizedPaths[index].IsRoot)
+            {
+                clauses.Add("1 = 1");
+                continue;
+            }
+
+            var pathParameterName = "$path" + index.ToString(CultureInfo.InvariantCulture);
+            var prefixParameterName = "$prefix" + index.ToString(CultureInfo.InvariantCulture);
+            clauses.Add($"(a.library_relative_path = {pathParameterName} OR a.library_relative_path LIKE {prefixParameterName} ESCAPE '\\')");
+            command.Parameters.AddWithValue(pathParameterName, normalizedPaths[index].Value);
+            command.Parameters.AddWithValue(prefixParameterName, EscapeLike(normalizedPaths[index].Value + "/") + "%");
+        }
+
+        command.CommandText = BuildAssetSelectSql(string.Join(" OR ", clauses));
+        return await ReadAssetsAsync(command, cancellationToken);
+    }
+
     public async Task UpdateMetadataAsync(
         LibraryLocation location,
         Guid assetId,
@@ -366,6 +429,33 @@ public sealed partial class SqliteAssetLibraryRepository : IAssetLibraryReposito
         await command.ExecuteNonQueryAsync(cancellationToken);
 
         await RebuildSearchRowAsync(connection, transaction, assetId, cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    public async Task DeleteAssetAsync(
+        LibraryLocation location,
+        Guid assetId,
+        CancellationToken cancellationToken = default)
+    {
+        await using var connection = await OpenConnectionAsync(location, cancellationToken);
+        await using var transaction = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+
+        await using (var searchCommand = connection.CreateCommand())
+        {
+            searchCommand.Transaction = transaction;
+            searchCommand.CommandText = "DELETE FROM asset_search WHERE asset_id = $assetId;";
+            searchCommand.Parameters.AddWithValue("$assetId", assetId.ToString("D"));
+            await searchCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
+        await using (var assetCommand = connection.CreateCommand())
+        {
+            assetCommand.Transaction = transaction;
+            assetCommand.CommandText = "DELETE FROM assets WHERE id = $assetId;";
+            assetCommand.Parameters.AddWithValue("$assetId", assetId.ToString("D"));
+            await assetCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+
         await transaction.CommitAsync(cancellationToken);
     }
 
@@ -534,6 +624,39 @@ public sealed partial class SqliteAssetLibraryRepository : IAssetLibraryReposito
         }
 
         return assets;
+    }
+
+    private static string BuildAssetSelectSql(string whereClause)
+    {
+        return $"""
+            SELECT
+                a.id,
+                a.display_name,
+                a.library_relative_path,
+                a.source_path,
+                a.kind,
+                a.extension,
+                a.size_bytes,
+                a.created_at,
+                a.modified_at,
+                a.imported_at,
+                a.content_hash,
+                a.notes,
+                a.status,
+                COALESCE((
+                    SELECT group_concat(ordered_tags.name, ', ')
+                    FROM (
+                        SELECT t.name
+                        FROM asset_tags at
+                        INNER JOIN tags t ON t.id = at.tag_id
+                        WHERE at.asset_id = a.id
+                        ORDER BY t.name COLLATE NOCASE
+                    ) ordered_tags
+                ), '') AS tags
+            FROM assets a
+            WHERE {whereClause}
+            ORDER BY a.imported_at DESC, a.display_name COLLATE NOCASE;
+            """;
     }
 
     private static async Task<SqliteConnection> OpenConnectionAsync(

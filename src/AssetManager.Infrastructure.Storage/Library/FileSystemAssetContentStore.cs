@@ -44,6 +44,7 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         var copiedFiles = new List<PreparedAssetFile>();
         var createdFolders = new HashSet<LibraryRelativePath>();
         var copyThrottle = CopyThrottle.Create(importOptions);
+        var progressTracker = ImportProgressTracker.Create(importOptions);
         try
         {
             foreach (var rawPath in sourcePaths)
@@ -64,6 +65,7 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
                         targetFolderPath,
                         [],
                         copyThrottle,
+                        progressTracker,
                         cancellationToken));
                     continue;
                 }
@@ -75,6 +77,7 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
                         sourcePath,
                         targetFolderPath,
                         copyThrottle,
+                        progressTracker,
                         cancellationToken);
                     copiedFiles.AddRange(copyResult.CopiedFiles);
                     foreach (var createdFolder in copyResult.CreatedFolders)
@@ -210,6 +213,57 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         return files;
     }
 
+    public async Task<IReadOnlyList<StoredContentFile>> ScanContentFilesAsync(
+        LibraryLocation location,
+        IEnumerable<LibraryRelativePath> paths,
+        CancellationToken cancellationToken = default)
+    {
+        if (!Directory.Exists(location.RootPath))
+        {
+            return [];
+        }
+
+        var files = new Dictionary<string, StoredContentFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths.DistinctBy(path => path.Value, StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var fullPath = path.ToFullPath(location.RootPath);
+            if (location.IsManagementPath(fullPath))
+            {
+                continue;
+            }
+
+            if (File.Exists(fullPath))
+            {
+                var file = await BuildStoredContentFileAsync(location, fullPath, cancellationToken);
+                files[file.LibraryRelativePath.Value] = file;
+                continue;
+            }
+
+            if (!Directory.Exists(fullPath))
+            {
+                continue;
+            }
+
+            foreach (var filePath in Directory.EnumerateFiles(fullPath, "*", SearchOption.AllDirectories))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (location.IsManagementPath(filePath))
+                {
+                    continue;
+                }
+
+                var file = await BuildStoredContentFileAsync(location, filePath, cancellationToken);
+                files[file.LibraryRelativePath.Value] = file;
+            }
+        }
+
+        return files.Values
+            .OrderBy(file => file.LibraryRelativePath.Value, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     public Task<bool> FileExistsAsync(string fullPath, CancellationToken cancellationToken = default)
     {
         return Task.FromResult(File.Exists(fullPath));
@@ -233,6 +287,7 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         string sourceDirectory,
         string targetFolderPath,
         CopyThrottle? copyThrottle,
+        ImportProgressTracker? progressTracker,
         CancellationToken cancellationToken)
     {
         if (IsSameOrDescendantPath(targetFolderPath, sourceDirectory))
@@ -269,14 +324,17 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
                 var relativeFile = Path.GetRelativePath(sourceDirectory, file);
                 var destinationFile = Path.Combine(destinationRoot, relativeFile);
                 Directory.CreateDirectory(Path.GetDirectoryName(destinationFile)!);
+                var sourceFileInfo = new FileInfo(file);
+                progressTracker?.RegisterDiscoveredFile(sourceFileInfo.Name, sourceFileInfo.Length);
                 try
                 {
                     copiedFiles.Add(await CopyImportedFileAsync(
                         location,
-                        file,
+                        sourceFileInfo,
                         destinationFile,
                         createdDirectories,
                         copyThrottle,
+                        progressTracker,
                         cancellationToken));
                 }
                 catch
@@ -306,17 +364,21 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         string targetFolderPath,
         IReadOnlyList<LibraryRelativePath> createdDirectories,
         CopyThrottle? copyThrottle,
+        ImportProgressTracker? progressTracker,
         CancellationToken cancellationToken)
     {
         var destinationPath = GetUniqueFilePath(Path.Combine(targetFolderPath, Path.GetFileName(sourcePath)));
+        var sourceFileInfo = new FileInfo(sourcePath);
+        progressTracker?.RegisterDiscoveredFile(sourceFileInfo.Name, sourceFileInfo.Length);
         try
         {
             return await CopyImportedFileAsync(
                 location,
-                sourcePath,
+                sourceFileInfo,
                 destinationPath,
                 createdDirectories,
                 copyThrottle,
+                progressTracker,
                 cancellationToken);
         }
         catch
@@ -332,24 +394,27 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
 
     private async Task<PreparedAssetFile> CopyImportedFileAsync(
         LibraryLocation location,
-        string sourcePath,
+        FileInfo sourceFileInfo,
         string destinationPath,
         IReadOnlyList<LibraryRelativePath> createdDirectories,
         CopyThrottle? copyThrottle,
+        ImportProgressTracker? progressTracker,
         CancellationToken cancellationToken)
     {
-        var sourceFileInfo = new FileInfo(sourcePath);
         var contentHash = await CopyFileAndComputeHashAsync(
-            sourcePath,
+            sourceFileInfo.FullName,
             destinationPath,
+            sourceFileInfo.Name,
             copyThrottle,
+            progressTracker,
             cancellationToken);
         ApplySourceFileMetadata(sourceFileInfo, destinationPath);
+        progressTracker?.MarkFileCopied(sourceFileInfo.Name);
 
         return CreatePreparedAssetFile(
             location,
             destinationPath,
-            sourcePath,
+            sourceFileInfo.FullName,
             createdDirectories,
             contentHash);
     }
@@ -429,7 +494,9 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
     private static async Task<string> CopyFileAndComputeHashAsync(
         string sourcePath,
         string destinationPath,
+        string sourceFileName,
         CopyThrottle? copyThrottle,
+        ImportProgressTracker? progressTracker,
         CancellationToken cancellationToken)
     {
         var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
@@ -473,6 +540,7 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
                 await destinationStream.WriteAsync(
                     buffer.AsMemory(0, bytesRead),
                     cancellationToken);
+                progressTracker?.ReportBytesCopied(sourceFileName, bytesRead);
 
                 if (copyThrottle is not null)
                 {
@@ -486,6 +554,106 @@ public sealed class FileSystemAssetContentStore : IAssetContentStore
         finally
         {
             ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private sealed class ImportProgressTracker
+    {
+        private const int ByteReportStepBytes = 4 * 1024 * 1024;
+        private const int ByteReportIntervalMilliseconds = 200;
+
+        private readonly object _reportGate = new();
+        private readonly IProgress<AssetImportProgress> _progress;
+        private int _copiedFiles;
+        private int _discoveredFiles;
+        private long _copiedBytes;
+        private long _discoveredBytes;
+        private long _lastReportedCopiedBytes;
+        private long _lastByteReportTick = Environment.TickCount64;
+
+        private ImportProgressTracker(IProgress<AssetImportProgress> progress)
+        {
+            _progress = progress;
+        }
+
+        public static ImportProgressTracker? Create(AssetImportOptions? importOptions)
+        {
+            return importOptions?.Progress is null
+                ? null
+                : new ImportProgressTracker(importOptions.Progress);
+        }
+
+        public void RegisterDiscoveredFile(string fileName, long fileSize)
+        {
+            var discoveredFiles = Interlocked.Increment(ref _discoveredFiles);
+            var discoveredBytes = Interlocked.Add(ref _discoveredBytes, fileSize);
+
+            Report(
+                fileName,
+                discoveredFiles,
+                Volatile.Read(ref _copiedFiles),
+                discoveredBytes,
+                Volatile.Read(ref _copiedBytes));
+        }
+
+        public void ReportBytesCopied(string fileName, int copiedBytes)
+        {
+            var totalCopiedBytes = Interlocked.Add(ref _copiedBytes, copiedBytes);
+            if (!ShouldReportCopiedBytes(totalCopiedBytes))
+            {
+                return;
+            }
+
+            Report(
+                fileName,
+                Volatile.Read(ref _discoveredFiles),
+                Volatile.Read(ref _copiedFiles),
+                Volatile.Read(ref _discoveredBytes),
+                totalCopiedBytes);
+        }
+
+        public void MarkFileCopied(string fileName)
+        {
+            var copiedFiles = Interlocked.Increment(ref _copiedFiles);
+            Report(
+                fileName,
+                Volatile.Read(ref _discoveredFiles),
+                copiedFiles,
+                Volatile.Read(ref _discoveredBytes),
+                Volatile.Read(ref _copiedBytes));
+        }
+
+        private bool ShouldReportCopiedBytes(long totalCopiedBytes)
+        {
+            var now = Environment.TickCount64;
+
+            lock (_reportGate)
+            {
+                if (totalCopiedBytes - _lastReportedCopiedBytes < ByteReportStepBytes
+                    && now - _lastByteReportTick < ByteReportIntervalMilliseconds)
+                {
+                    return false;
+                }
+
+                _lastReportedCopiedBytes = totalCopiedBytes;
+                _lastByteReportTick = now;
+                return true;
+            }
+        }
+
+        private void Report(
+            string fileName,
+            int discoveredFiles,
+            int copiedFiles,
+            long discoveredBytes,
+            long copiedBytes)
+        {
+            _progress.Report(new AssetImportProgress(
+                copiedFiles,
+                discoveredFiles,
+                copiedBytes,
+                discoveredBytes,
+                fileName));
         }
     }
 
