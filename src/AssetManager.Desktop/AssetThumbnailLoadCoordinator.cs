@@ -1,4 +1,7 @@
+using System.Globalization;
 using System.Windows.Threading;
+using AssetManager.Application.BackgroundTasks;
+using AssetManager.Desktop.Localization;
 using AssetManager.Domain.Library;
 using AssetManager.Infrastructure.Windows;
 
@@ -7,55 +10,69 @@ namespace AssetManager.Desktop;
 public sealed class AssetThumbnailLoadCoordinator : IDisposable
 {
     private readonly WindowsThumbnailCacheService _thumbnailCacheService;
+    private readonly IBackgroundTaskCenter _backgroundTaskCenter;
     private readonly Dispatcher _dispatcher;
 
-    private CancellationTokenSource? _loadCts;
-    private long _statusGeneration;
-
-    public event Action<ThumbnailLoadStatus>? StatusChanged;
+    private IBackgroundTaskSession? _session;
 
     public AssetThumbnailLoadCoordinator(
         WindowsThumbnailCacheService thumbnailCacheService,
+        IBackgroundTaskCenter backgroundTaskCenter,
         Dispatcher dispatcher)
     {
         _thumbnailCacheService = thumbnailCacheService;
+        _backgroundTaskCenter = backgroundTaskCenter;
         _dispatcher = dispatcher;
     }
 
     public void Reload(LibraryLocation location, IEnumerable<AssetRow> rows)
     {
         Cancel();
-        var generation = Interlocked.Increment(ref _statusGeneration);
 
         var candidates = rows
             .Where(row => row.CanRequestThumbnail)
             .ToArray();
         if (candidates.Length == 0)
         {
-            PublishStatus(ThumbnailLoadStatus.Idle, generation);
             return;
         }
 
-        PublishStatus(new ThumbnailLoadStatus(true, 0, candidates.Length), generation);
-        var loadCts = new CancellationTokenSource();
-        _loadCts = loadCts;
-        _ = Task.Run(() => LoadAsync(location, candidates, generation, loadCts.Token));
+        var progressFormat = LocalizationManager.Get("BackgroundTaskThumbnailProgressFormat");
+        var unitLabel = LocalizationManager.Get("BackgroundTaskProgressUnitItems");
+        var completedText = LocalizationManager.Get("BackgroundTaskThumbnailCompleted");
+        var canceledText = LocalizationManager.Get("BackgroundTaskThumbnailCanceled");
+        var failedAtFormat = LocalizationManager.Get("BackgroundTaskThumbnailFailedAtFormat");
+        var session = _backgroundTaskCenter.StartTask(
+            new BackgroundTaskStartRequest(
+                BackgroundTaskKind.GenerateThumbnails,
+                LocalizationManager.Get("BackgroundTaskThumbnailTitle"),
+                string.Format(CultureInfo.CurrentCulture, progressFormat, 0, candidates.Length),
+                IsCancelable: true,
+                InitialProgress: new BackgroundTaskProgress(
+                    0,
+                    candidates.Length,
+                    unitLabel)));
+
+        _session = session;
+        var taskText = new ThumbnailTaskText(
+            progressFormat,
+            unitLabel,
+            completedText,
+            canceledText,
+            failedAtFormat);
+        _ = Task.Run(() => LoadAsync(location, candidates, session, taskText));
     }
 
     public void Cancel()
     {
-        var generation = Interlocked.Increment(ref _statusGeneration);
-
-        if (_loadCts is null)
+        if (_session is null)
         {
-            PublishStatus(ThumbnailLoadStatus.Idle, generation);
             return;
         }
 
-        _loadCts.Cancel();
-        _loadCts.Dispose();
-        _loadCts = null;
-        PublishStatus(ThumbnailLoadStatus.Idle, generation);
+        _session.Cancel(LocalizationManager.Get("BackgroundTaskThumbnailCanceled"));
+        _session.Dispose();
+        _session = null;
     }
 
     public void Dispose()
@@ -66,91 +83,71 @@ public sealed class AssetThumbnailLoadCoordinator : IDisposable
     private async Task LoadAsync(
         LibraryLocation location,
         IReadOnlyList<AssetRow> rows,
-        long generation,
-        CancellationToken cancellationToken)
+        IBackgroundTaskSession session,
+        ThumbnailTaskText text)
     {
         var completedCount = 0;
+        var latestStatusText = string.Format(CultureInfo.CurrentCulture, text.ProgressFormat, 0, rows.Count);
 
         try
         {
             foreach (var row in rows)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                session.CancellationToken.ThrowIfCancellationRequested();
 
                 var thumbnailPath = await _thumbnailCacheService.GetOrCreateAsync(
                     location,
                     row.Asset,
-                    cancellationToken);
-                if (string.IsNullOrWhiteSpace(thumbnailPath))
+                    session.CancellationToken);
+                if (!string.IsNullOrWhiteSpace(thumbnailPath))
                 {
-                    completedCount++;
-                    await PublishStatusAsync(
-                        new ThumbnailLoadStatus(true, completedCount, rows.Count),
-                        generation,
-                        cancellationToken);
-                    continue;
+                    await _dispatcher.InvokeAsync(
+                        () => row.SetThumbnailPath(thumbnailPath),
+                        DispatcherPriority.Background,
+                        session.CancellationToken);
                 }
 
-                await _dispatcher.InvokeAsync(
-                    () =>
-                    {
-                        row.SetThumbnailPath(thumbnailPath);
-                        if (generation == Interlocked.Read(ref _statusGeneration))
-                        {
-                            StatusChanged?.Invoke(new ThumbnailLoadStatus(true, completedCount + 1, rows.Count));
-                        }
-                    },
-                    DispatcherPriority.Background,
-                    cancellationToken);
                 completedCount++;
+                latestStatusText = string.Format(CultureInfo.CurrentCulture, text.ProgressFormat, completedCount, rows.Count);
+                session.Update(
+                    latestStatusText,
+                    new BackgroundTaskProgress(
+                        completedCount,
+                        rows.Count,
+                        text.UnitLabel));
             }
+
+            session.Complete(text.CompletedText);
         }
         catch (OperationCanceledException)
         {
+            session.Cancel(text.CanceledText);
+        }
+        catch (Exception ex)
+        {
+            session.Fail(
+                ex,
+                string.Format(
+                    CultureInfo.CurrentCulture,
+                    text.FailedAtFormat,
+                    latestStatusText,
+                    ex.Message));
         }
         finally
         {
-            PublishStatus(ThumbnailLoadStatus.Idle, generation);
-        }
-    }
-
-    private void PublishStatus(ThumbnailLoadStatus status, long generation)
-    {
-        if (generation != Interlocked.Read(ref _statusGeneration))
-        {
-            return;
-        }
-
-        if (_dispatcher.CheckAccess())
-        {
-            StatusChanged?.Invoke(status);
-            return;
-        }
-
-        _ = _dispatcher.InvokeAsync(
-            () => StatusChanged?.Invoke(status),
-            DispatcherPriority.Background);
-    }
-
-    private Task PublishStatusAsync(
-        ThumbnailLoadStatus status,
-        long generation,
-        CancellationToken cancellationToken)
-    {
-        if (generation != Interlocked.Read(ref _statusGeneration))
-        {
-            return Task.CompletedTask;
-        }
-
-        return _dispatcher.InvokeAsync(
-            () =>
+            if (ReferenceEquals(_session, session))
             {
-                if (generation == Interlocked.Read(ref _statusGeneration))
-                {
-                    StatusChanged?.Invoke(status);
-                }
-            },
-            DispatcherPriority.Background,
-            cancellationToken).Task;
+                _session = null;
+            }
+
+            session.Dispose();
+        }
     }
+
+    private sealed record ThumbnailTaskText(
+        string ProgressFormat,
+        string UnitLabel,
+        string CompletedText,
+        string CanceledText,
+        string FailedAtFormat);
 }
