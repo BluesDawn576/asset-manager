@@ -9,6 +9,10 @@ namespace AssetManager.Infrastructure.Storage.Library;
 public sealed partial class SqliteAssetLibraryRepository : IAssetLibraryRepository
 {
     private const int SchemaVersion = 1;
+    // SQLite expression tree depth limit is 1000 nodes. Each path in GetByRelativePathsAsync
+    // adds 1 OR term; each path in GetByRelativePathPrefixesAsync adds ~2 terms (equality + LIKE).
+    // A batch size of 400 keeps both well under the limit (400 for paths, 800 for prefixes).
+    private const int QueryBatchSize = 400;
 
     public async Task InitializeAsync(LibraryLocation location, CancellationToken cancellationToken = default)
     {
@@ -277,18 +281,25 @@ public sealed partial class SqliteAssetLibraryRepository : IAssetLibraryReposito
             return [];
         }
 
+        var allAssets = new List<AssetRecord>();
         await using var connection = await OpenConnectionAsync(location, cancellationToken);
-        await using var command = connection.CreateCommand();
-        var clauses = new List<string>();
-        for (var index = 0; index < normalizedPaths.Length; index++)
+
+        foreach (var batch in normalizedPaths.Chunk(QueryBatchSize))
         {
-            var parameterName = "$path" + index.ToString(CultureInfo.InvariantCulture);
-            clauses.Add("a.library_relative_path = " + parameterName);
-            command.Parameters.AddWithValue(parameterName, normalizedPaths[index]);
+            await using var command = connection.CreateCommand();
+            var clauses = new List<string>();
+            for (var index = 0; index < batch.Length; index++)
+            {
+                var parameterName = "$path" + index.ToString(CultureInfo.InvariantCulture);
+                clauses.Add("a.library_relative_path = " + parameterName);
+                command.Parameters.AddWithValue(parameterName, batch[index]);
+            }
+
+            command.CommandText = BuildAssetSelectSql(string.Join(" OR ", clauses));
+            allAssets.AddRange(await ReadAssetsAsync(command, cancellationToken));
         }
 
-        command.CommandText = BuildAssetSelectSql(string.Join(" OR ", clauses));
-        return await ReadAssetsAsync(command, cancellationToken);
+        return allAssets;
     }
 
     public async Task<IReadOnlyList<AssetRecord>> GetByRelativePathPrefixesAsync(
@@ -304,26 +315,33 @@ public sealed partial class SqliteAssetLibraryRepository : IAssetLibraryReposito
             return [];
         }
 
+        var allAssets = new List<AssetRecord>();
         await using var connection = await OpenConnectionAsync(location, cancellationToken);
-        await using var command = connection.CreateCommand();
-        var clauses = new List<string>();
-        for (var index = 0; index < normalizedPaths.Length; index++)
+
+        foreach (var batch in normalizedPaths.Chunk(QueryBatchSize))
         {
-            if (normalizedPaths[index].IsRoot)
+            await using var command = connection.CreateCommand();
+            var clauses = new List<string>();
+            for (var index = 0; index < batch.Length; index++)
             {
-                clauses.Add("1 = 1");
-                continue;
+                if (batch[index].IsRoot)
+                {
+                    clauses.Add("1 = 1");
+                    continue;
+                }
+
+                var pathParameterName = "$path" + index.ToString(CultureInfo.InvariantCulture);
+                var prefixParameterName = "$prefix" + index.ToString(CultureInfo.InvariantCulture);
+                clauses.Add($"(a.library_relative_path = {pathParameterName} OR a.library_relative_path LIKE {prefixParameterName} ESCAPE '\\')");
+                command.Parameters.AddWithValue(pathParameterName, batch[index].Value);
+                command.Parameters.AddWithValue(prefixParameterName, EscapeLike(batch[index].Value + "/") + "%");
             }
 
-            var pathParameterName = "$path" + index.ToString(CultureInfo.InvariantCulture);
-            var prefixParameterName = "$prefix" + index.ToString(CultureInfo.InvariantCulture);
-            clauses.Add($"(a.library_relative_path = {pathParameterName} OR a.library_relative_path LIKE {prefixParameterName} ESCAPE '\\')");
-            command.Parameters.AddWithValue(pathParameterName, normalizedPaths[index].Value);
-            command.Parameters.AddWithValue(prefixParameterName, EscapeLike(normalizedPaths[index].Value + "/") + "%");
+            command.CommandText = BuildAssetSelectSql(string.Join(" OR ", clauses));
+            allAssets.AddRange(await ReadAssetsAsync(command, cancellationToken));
         }
 
-        command.CommandText = BuildAssetSelectSql(string.Join(" OR ", clauses));
-        return await ReadAssetsAsync(command, cancellationToken);
+        return allAssets;
     }
 
     public async Task UpdateMetadataAsync(

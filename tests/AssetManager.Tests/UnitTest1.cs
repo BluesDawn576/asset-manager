@@ -886,6 +886,80 @@ public class UnitTest1
         Assert.Throws<InvalidOperationException>(() => registry.Register(new TestPlugin("demo.preview")));
     }
 
+    [Fact]
+    public async Task GetByRelativePathsAsync_Over1000PathsReturnsResults()
+    {
+        var tempRoot = CreateTempRoot();
+
+        try
+        {
+            var repo = new SqliteAssetLibraryRepository();
+            var location = LibraryLocation.Create(tempRoot);
+            await repo.InitializeAsync(location);
+
+            var assets = Enumerable.Range(0, 1100).Select(i => new PreparedAssetFile(
+                $"Asset{i}.txt",
+                LibraryRelativePath.Create($"asset{i}.txt"),
+                null,
+                AssetTypeId.Text,
+                ".txt",
+                100,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow,
+                $"hash{i}",
+                [])).ToArray();
+
+            await repo.AddAssetsAsync(location, assets);
+
+            var allPaths = assets.Select(a => a.LibraryRelativePath).ToArray();
+            var results = await repo.GetByRelativePathsAsync(location, allPaths);
+
+            Assert.Equal(1100, results.Count);
+        }
+        finally
+        {
+            DeleteTempRoot(tempRoot);
+        }
+    }
+
+    [Fact]
+    public async Task GetByRelativePathPrefixesAsync_Over1000PrefixesReturnsResults()
+    {
+        var tempRoot = CreateTempRoot();
+
+        try
+        {
+            var repo = new SqliteAssetLibraryRepository();
+            var location = LibraryLocation.Create(tempRoot);
+            await repo.InitializeAsync(location);
+
+            var assets = Enumerable.Range(0, 1100).Select(i => new PreparedAssetFile(
+                $"Asset{i}.txt",
+                LibraryRelativePath.Create($"folder{i}/asset.txt"),
+                null,
+                AssetTypeId.Text,
+                ".txt",
+                100,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow,
+                $"hash{i}",
+                [LibraryRelativePath.Create($"folder{i}")])).ToArray();
+
+            await repo.AddAssetsAsync(location, assets);
+
+            var prefixPaths = assets.Select(a => a.LibraryRelativePath).ToArray();
+            var results = await repo.GetByRelativePathPrefixesAsync(location, prefixPaths);
+
+            Assert.Equal(1100, results.Count);
+        }
+        finally
+        {
+            DeleteTempRoot(tempRoot);
+        }
+    }
+
     private static LibraryApplicationService CreateLibraryService()
     {
         var assetTypeResolver = new BuiltInAssetTypeResolver();
