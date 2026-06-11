@@ -28,6 +28,12 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
             typeof(VirtualizingTilePanel),
             new FrameworkPropertyMetadata(1, FrameworkPropertyMetadataOptions.AffectsMeasure));
 
+    public static readonly RoutedEvent VerticalOffsetChangedEvent = EventManager.RegisterRoutedEvent(
+        nameof(VerticalOffsetChanged),
+        RoutingStrategy.Bubble,
+        typeof(RoutedEventHandler),
+        typeof(VirtualizingTilePanel));
+
     private int _itemsPerRow = 1;
     private double _extentWidth;
     private double _extentHeight;
@@ -52,6 +58,12 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
     {
         get => (int)GetValue(OverscanRowsProperty);
         set => SetValue(OverscanRowsProperty, value);
+    }
+
+    public event RoutedEventHandler VerticalOffsetChanged
+    {
+        add => AddHandler(VerticalOffsetChangedEvent, value);
+        remove => RemoveHandler(VerticalOffsetChangedEvent, value);
     }
 
     public bool CanHorizontallyScroll { get; set; }
@@ -284,6 +296,7 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
         _verticalOffset = nextOffset;
         ScrollOwner?.InvalidateScrollInfo();
         InvalidateMeasure();
+        RaiseEvent(new RoutedEventArgs(VerticalOffsetChangedEvent));
     }
 
     private void RealizeChildren(int firstIndex, int lastIndex, Size itemSize)

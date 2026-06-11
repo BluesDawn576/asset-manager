@@ -84,6 +84,37 @@ public sealed class UiSettingsStore
         await WriteSettingsAsync(settings, cancellationToken);
     }
 
+    public async Task<AssetViewSettings> GetAssetViewSettingsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var settings = await ReadSettingsAsync(cancellationToken);
+        var assetView = settings?.AssetViewSettings;
+        return assetView is null
+            ? AssetViewSettings.Default
+            : new AssetViewSettings(
+                assetView.AssetPreviewScale,
+                assetView.IsDetailsPanelExpanded,
+                assetView.DetailsPanelWidth,
+                assetView.CurrentFolder,
+                assetView.AssetListVerticalOffset);
+    }
+
+    public async Task SaveAssetViewSettingsAsync(
+        AssetViewSettings assetViewSettings,
+        CancellationToken cancellationToken = default)
+    {
+        var settings = await ReadSettingsAsync(cancellationToken) ?? new UiSettingsFile();
+        settings.AssetViewSettings = new AssetViewSettingsFile
+        {
+            AssetPreviewScale = assetViewSettings.AssetPreviewScale,
+            IsDetailsPanelExpanded = assetViewSettings.IsDetailsPanelExpanded,
+            DetailsPanelWidth = assetViewSettings.DetailsPanelWidth,
+            CurrentFolder = assetViewSettings.CurrentFolder,
+            AssetListVerticalOffset = assetViewSettings.AssetListVerticalOffset
+        };
+        await WriteSettingsAsync(settings, cancellationToken);
+    }
+
     private static string GetDefaultSettingsPath()
     {
         var appDataRoot = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -143,6 +174,8 @@ public sealed class UiSettingsStore
         public ThumbnailDisplaySettingsFile? ThumbnailDisplaySettings { get; set; }
 
         public bool LowImpactImportEnabled { get; set; }
+
+        public AssetViewSettingsFile? AssetViewSettings { get; set; }
     }
 
     private sealed class ThumbnailDisplaySettingsFile
@@ -157,4 +190,32 @@ public sealed class UiSettingsStore
 
         public bool ShowSize { get; set; } = ThumbnailDisplaySettings.Default.ShowSize;
     }
+
+    private sealed class AssetViewSettingsFile
+    {
+        public double AssetPreviewScale { get; set; } = AssetViewSettings.Default.AssetPreviewScale;
+
+        public bool IsDetailsPanelExpanded { get; set; } = AssetViewSettings.Default.IsDetailsPanelExpanded;
+
+        public double DetailsPanelWidth { get; set; } = AssetViewSettings.Default.DetailsPanelWidth;
+
+        public string CurrentFolder { get; set; } = AssetViewSettings.Default.CurrentFolder;
+
+        public double AssetListVerticalOffset { get; set; } = AssetViewSettings.Default.AssetListVerticalOffset;
+    }
+}
+
+public sealed record AssetViewSettings(
+    double AssetPreviewScale,
+    bool IsDetailsPanelExpanded,
+    double DetailsPanelWidth,
+    string CurrentFolder,
+    double AssetListVerticalOffset)
+{
+    public static AssetViewSettings Default { get; } = new(
+        AssetPreviewScale: 1d,
+        IsDetailsPanelExpanded: true,
+        DetailsPanelWidth: 360d,
+        CurrentFolder: string.Empty,
+        AssetListVerticalOffset: 0d);
 }

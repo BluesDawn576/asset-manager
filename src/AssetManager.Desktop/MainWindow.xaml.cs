@@ -6,6 +6,7 @@ using System.Linq;
 using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -26,9 +27,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private const double DefaultAssetTileHeight = 298d;
     private const double DefaultAssetCardWidth = 210d;
     private const double DefaultAssetCardHeight = 286d;
-    private const double MinAssetPreviewScale = 0.75d;
-    private const double MaxAssetPreviewScale = 1.8d;
+    private const double MinAssetPreviewScale = 0.45d;
+    private const double MaxAssetPreviewScale = 2.25d;
     private const double AssetPreviewScaleStep = 0.1d;
+    private const double DefaultDetailsPanelWidth = 360d;
 
     private readonly LibraryApplicationService _libraryService;
     private readonly KnownLibraryApplicationService _knownLibraryService;
@@ -50,7 +52,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _isChangingLanguage;
     private bool _isBusy;
     private bool _isLowImpactImportEnabled;
+    private bool _isDetailsPanelExpanded = true;
     private double _assetPreviewScale = 1d;
+    private double _detailsPanelWidth = DefaultDetailsPanelWidth;
+    private double _assetListVerticalOffset;
+    private bool _isRestoringAssetListScroll;
+    private AssetViewSettings _assetViewSettings = AssetViewSettings.Default;
     private ThumbnailDisplaySettings _thumbnailDisplaySettings = ThumbnailDisplaySettings.Default;
     private IReadOnlyList<BackgroundTaskSnapshot> _backgroundTaskSnapshots = [];
     private BackgroundTasksWindow? _backgroundTasksWindow;
@@ -126,6 +133,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public double AssetCardWidth => DefaultAssetCardWidth * _assetPreviewScale;
 
     public double AssetCardHeight => DefaultAssetCardHeight * _assetPreviewScale;
+
+    public Visibility DetailsPanelVisibility => _isDetailsPanelExpanded ? Visibility.Visible : Visibility.Collapsed;
+
+    public string DetailsPanelToggleText => LocalizationManager.Get(
+        _isDetailsPanelExpanded ? "CollapseDetailsPanelButton" : "ExpandDetailsPanelButton");
 
     public bool IsLowImpactImportEnabled
     {
@@ -232,6 +244,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
             RefreshBackgroundTaskPresentation();
             OnPropertyChanged(nameof(BackgroundTaskStatusMessage));
+            OnPropertyChanged(nameof(DetailsPanelToggleText));
             StatusMessage = LocalizationManager.Get("StatusLanguageChanged");
         });
     }
@@ -242,6 +255,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             await LoadThumbnailDisplaySettingsAsync();
             await LoadImportBehaviorSettingsAsync();
+            await LoadAssetViewSettingsAsync();
 
             var activeLibrary = await _knownLibraryService.GetActiveAsync();
             await RefreshKnownLibrariesAsync(activeLibrary?.Id);
@@ -441,6 +455,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         _currentFolder = folder.RelativePath;
+        _assetListVerticalOffset = 0d;
+        _ = SaveAssetViewSettingsAsync();
         UpdateCurrentFolderMessage();
         await RunUiAsync(() => RefreshAssetsAsync());
     }
@@ -477,6 +493,35 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ApplyThumbnailDisplaySettings(dialog.Settings);
             await _uiSettingsStore.SaveThumbnailDisplaySettingsAsync(dialog.Settings);
         });
+    }
+
+    private void ToggleDetailsPanel_Click(object sender, RoutedEventArgs e)
+    {
+        _isDetailsPanelExpanded = !_isDetailsPanelExpanded;
+        ApplyDetailsPanelState(captureCurrentWidth: true);
+        _ = SaveAssetViewSettingsAsync();
+    }
+
+    private void DetailsGridSplitter_DragCompleted(object sender, DragCompletedEventArgs e)
+    {
+        if (!_isDetailsPanelExpanded)
+        {
+            return;
+        }
+
+        _detailsPanelWidth = Math.Max(260d, DetailsColumn.ActualWidth);
+        _ = SaveAssetViewSettingsAsync();
+    }
+
+    private void AssetTilePanel_VerticalOffsetChanged(object sender, RoutedEventArgs e)
+    {
+        if (_isRestoringAssetListScroll || e.OriginalSource is not VirtualizingTilePanel panel)
+        {
+            return;
+        }
+
+        _assetListVerticalOffset = panel.VerticalOffset;
+        _ = SaveAssetViewSettingsAsync();
     }
 
     private async void LowImpactImportCheckBox_Click(object sender, RoutedEventArgs e)
@@ -577,6 +622,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         var direction = e.Delta > 0 ? 1d : -1d;
         SetAssetPreviewScale(_assetPreviewScale + (direction * AssetPreviewScaleStep));
+        _ = SaveAssetViewSettingsAsync();
         e.Handled = true;
     }
 
@@ -780,6 +826,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         ScheduleThumbnailLoading();
+        RestoreAssetListScroll();
     }
 
     private async Task LoadPreviewAsync(AssetRow row)
@@ -861,6 +908,32 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         return null;
     }
 
+    private static T? FindDescendant<T>(DependencyObject? source)
+        where T : DependencyObject
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(source); index++)
+        {
+            var child = VisualTreeHelper.GetChild(source, index);
+            if (child is T target)
+            {
+                return target;
+            }
+
+            var descendant = FindDescendant<T>(child);
+            if (descendant is not null)
+            {
+                return descendant;
+            }
+        }
+
+        return null;
+    }
+
     private bool TryGetLibrary(out LibraryLocation location)
     {
         if (_libraryLocation is not null)
@@ -911,7 +984,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private async Task ApplyLibrarySessionAsync(LibrarySession session)
     {
         _libraryLocation = session.Location;
-        _currentFolder = session.CurrentFolder;
+        _currentFolder = ResolveSavedFolder(session.CurrentFolder);
         _autoSyncQueued = false;
         _libraryChangeMonitor.Start(session.Location);
         UpdateLibraryRootMessage();
@@ -927,6 +1000,79 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private async Task LoadImportBehaviorSettingsAsync()
     {
         IsLowImpactImportEnabled = await _uiSettingsStore.GetLowImpactImportEnabledAsync();
+    }
+
+    private async Task LoadAssetViewSettingsAsync()
+    {
+        var settings = await _uiSettingsStore.GetAssetViewSettingsAsync();
+        _assetViewSettings = settings;
+        SetAssetPreviewScale(settings.AssetPreviewScale);
+        _isDetailsPanelExpanded = settings.IsDetailsPanelExpanded;
+        _detailsPanelWidth = Math.Clamp(settings.DetailsPanelWidth, 260d, 800d);
+        _assetListVerticalOffset = Math.Max(0d, settings.AssetListVerticalOffset);
+        ApplyDetailsPanelState();
+    }
+
+    private Task SaveAssetViewSettingsAsync()
+    {
+        return _uiSettingsStore.SaveAssetViewSettingsAsync(new AssetViewSettings(
+            _assetPreviewScale,
+            _isDetailsPanelExpanded,
+            _detailsPanelWidth,
+            _currentFolder.Value,
+            _assetListVerticalOffset));
+    }
+
+    private LibraryRelativePath ResolveSavedFolder(LibraryRelativePath fallbackFolder)
+    {
+        try
+        {
+            return LibraryRelativePath.Create(_assetViewSettings.CurrentFolder);
+        }
+        catch (ArgumentException)
+        {
+            return fallbackFolder;
+        }
+    }
+
+    private void RestoreAssetListScroll()
+    {
+        if (_assetListVerticalOffset <= 0d)
+        {
+            return;
+        }
+
+        _isRestoringAssetListScroll = true;
+        _ = Dispatcher.InvokeAsync(() =>
+        {
+            var panel = FindDescendant<VirtualizingTilePanel>(AssetList);
+            panel?.SetVerticalOffset(_assetListVerticalOffset);
+            _isRestoringAssetListScroll = false;
+        }, DispatcherPriority.Background);
+    }
+
+    private void ApplyDetailsPanelState(bool captureCurrentWidth = false)
+    {
+        if (_isDetailsPanelExpanded)
+        {
+            DetailsSplitterColumn.Width = new GridLength(3d);
+            DetailsColumn.MinWidth = 260d;
+            DetailsColumn.Width = new GridLength(_detailsPanelWidth);
+        }
+        else
+        {
+            if (captureCurrentWidth)
+            {
+                _detailsPanelWidth = Math.Max(260d, DetailsColumn.ActualWidth);
+            }
+
+            DetailsSplitterColumn.Width = new GridLength(0d);
+            DetailsColumn.MinWidth = 0d;
+            DetailsColumn.Width = new GridLength(0d);
+        }
+
+        OnPropertyChanged(nameof(DetailsPanelVisibility));
+        OnPropertyChanged(nameof(DetailsPanelToggleText));
     }
 
     private void ApplyThumbnailDisplaySettings(ThumbnailDisplaySettings settings)

@@ -49,7 +49,7 @@ Desktop 层位于 `src/AssetManager.Desktop/`：
 - `TextSnippetDialog.xaml` 用于新建文本片段。
 - `Localization/LocalizationManager.cs` 管理 WPF 资源字典切换、当前 `CultureInfo` 和语言持久化。
 - `Localization/Strings.zh-CN.xaml`、`Localization/Strings.en-US.xaml` 保存桌面端用户可见文案。
-- `Localization/UiSettingsStore.cs` 把 UI 设置写入 `%LOCALAPPDATA%\AssetManager\ui-settings.json`。
+- `Localization/UiSettingsStore.cs` 把 UI 设置写入 `%LOCALAPPDATA%\AssetManager\ui-settings.json`，包含语言设置（`languageName`）和素材视图设置（`assetViewSettings`：`assetPreviewScale`、`isDetailsPanelExpanded`、`detailsPanelWidth`）。
 - `AssetThumbnailLoadCoordinator.cs` 按顺序后台加载当前列表需要的图片缩略图，避免一次性打满磁盘和解码开销。
 
 Windows 文件交互和缩略图缓存由 `src/AssetManager.Infrastructure.Windows/` 提供。`WindowsFileTransferService.cs` 负责素材列表拖出和剪贴板 FileDrop；`WindowsThumbnailCacheService.cs` 负责把图片缩略图缓存到 `.asset-manager/thumbnails/`，卡片列表优先显示缓存图而不是直接打开原图。
@@ -183,7 +183,7 @@ dotnet test .\AssetManager.sln
 - 不要在 Domain 中加入文件系统探测或展示文案。文件是否存在、拖拽剪贴板、路径归一化等外部行为应留在 Infrastructure 或 Desktop。
 - 新增管理文件必须放进 `.asset-manager`，不能写在库根目录或素材旁。
 - 已知素材库列表必须保存在应用级配置中，当前默认路径是 `%LOCALAPPDATA%\AssetManager\known-libraries.json`，不要写进任何素材库目录。
-- UI 语言设置必须保存在应用级配置中，当前默认路径是 `%LOCALAPPDATA%\AssetManager\ui-settings.json`，不要写进素材库目录或 `.asset-manager`。
+- UI 语言设置必须保存在应用级配置中，当前默认路径是 `%LOCALAPPDATA%\AssetManager\ui-settings.json`，不要写进素材库目录或 `.asset-manager`。`ui-settings.json` 同时保存素材视图设置（预览缩放比、详情面板展开状态和面板宽度），启动时由 `MainWindow` 加载，Ctrl+滚轮缩放、详情面板展开/收起和详情 Splitter 拖动结束时触发保存。
 - 修改素材库注册或切换规则时，同步更新 `KnownLibraryRegistry_*` 测试。
 - 修改导入位置规则时，同步更新 `ImportPaths_CopiesIntoCurrentFolderWithoutAssetsDirectory` 测试。
 - 修改国际化资源或新增语言时，同步更新 `LocalizationResourceDictionaries_*` 测试。
@@ -215,3 +215,4 @@ dotnet test .\AssetManager.sln
 | 2026-06-08 16:31 | Adsicmes | 补充架构修复后的 AssetTypeId、类型 resolver、预览 renderer 和边界测试规则 |
 | 2026-06-08 16:31 | Adsicmes | 补充插件最小契约、SDK 基类和注册表说明 |
 | 2026-06-08 17:57 | Adsicmes | 补充图片缩略图缓存目录、后台加载队列和卡片显示规则 |
+| 2026-06-11 | Adsicmes | 补充 AssetViewSettings 持久化字段说明和 ui-settings.json 保存时机 |

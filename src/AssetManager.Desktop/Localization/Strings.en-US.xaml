@@ -83,6 +83,8 @@
     <sys:String x:Key="TagsTooltip">Separate tags with comma</sys:String>
     <sys:String x:Key="SaveMetadataButton">Save Metadata</sys:String>
     <sys:String x:Key="PreviewHeader">Preview</sys:String>
+    <sys:String x:Key="CollapseDetailsPanelButton">Collapse Details</sys:String>
+    <sys:String x:Key="ExpandDetailsPanelButton">Expand Details</sys:String>
     <sys:String x:Key="SelectAssetToPreview">Select an asset to preview.</sys:String>
     <sys:String x:Key="PlayButton">Play</sys:String>
     <sys:String x:Key="PauseButton">Pause</sys:String>

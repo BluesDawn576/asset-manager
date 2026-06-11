@@ -83,6 +83,8 @@
     <sys:String x:Key="TagsTooltip">多个标签用逗号分隔</sys:String>
     <sys:String x:Key="SaveMetadataButton">保存元数据</sys:String>
     <sys:String x:Key="PreviewHeader">预览</sys:String>
+    <sys:String x:Key="CollapseDetailsPanelButton">收起详情</sys:String>
+    <sys:String x:Key="ExpandDetailsPanelButton">展开详情</sys:String>
     <sys:String x:Key="SelectAssetToPreview">请选择一个素材进行预览。</sys:String>
     <sys:String x:Key="PlayButton">播放</sys:String>
     <sys:String x:Key="PauseButton">暂停</sys:String>
