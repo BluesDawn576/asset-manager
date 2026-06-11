@@ -7,6 +7,7 @@ using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 using AssetManager.Application.BackgroundTasks;
 using AssetManager.Application.Library;
@@ -20,6 +21,8 @@ namespace AssetManager.Desktop;
 
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
+    private const string AssetListDragDataFormat = "AssetManager.Desktop.AssetListDrag";
+
     private readonly LibraryApplicationService _libraryService;
     private readonly KnownLibraryApplicationService _knownLibraryService;
     private readonly AssetPreviewPresenter _previewPresenter;
@@ -31,6 +34,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private LibraryLocation? _libraryLocation;
     private LibraryRelativePath _currentFolder = LibraryRelativePath.Root;
     private Point _dragStartPoint;
+    private bool _canStartAssetDrag;
     private string _statusMessage = string.Empty;
     private string _libraryRootMessage = string.Empty;
     private string _currentFolderMessage = string.Empty;
@@ -494,7 +498,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private void AssetGrid_DragOver(object sender, DragEventArgs e)
     {
-        e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) && _libraryLocation is not null
+        e.Effects = !e.Data.GetDataPresent(AssetListDragDataFormat)
+                    && e.Data.GetDataPresent(DataFormats.FileDrop)
+                    && _libraryLocation is not null
             ? DragDropEffects.Copy
             : DragDropEffects.None;
         e.Handled = true;
@@ -502,6 +508,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void AssetGrid_Drop(object sender, DragEventArgs e)
     {
+        if (e.Data.GetDataPresent(AssetListDragDataFormat))
+        {
+            e.Handled = true;
+            return;
+        }
+
         var droppedPaths = WindowsFileTransferService.ExtractFilePaths(e.Data);
         if (droppedPaths.Count == 0)
         {
@@ -515,11 +527,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private void AssetList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         _dragStartPoint = e.GetPosition(null);
+        _canStartAssetDrag = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject) is not null;
     }
 
     private void AssetList_PreviewMouseMove(object sender, MouseEventArgs e)
     {
-        if (e.LeftButton != MouseButtonState.Pressed || !ShouldStartDrag(e.GetPosition(null)))
+        if (!_canStartAssetDrag
+            || e.LeftButton != MouseButtonState.Pressed
+            || !ShouldStartDrag(e.GetPosition(null)))
         {
             return;
         }
@@ -531,7 +546,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         var dataObject = WindowsFileTransferService.CreateFileDropDataObject(selectedPaths);
+        dataObject.SetData(AssetListDragDataFormat, true);
         DragDrop.DoDragDrop(AssetList, dataObject, DragDropEffects.Copy);
+        _canStartAssetDrag = false;
         StatusMessage = LocalizationManager.Format("StatusDraggedItemsFormat", selectedPaths.Length);
     }
 
@@ -783,6 +800,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         return horizontalChange > SystemParameters.MinimumHorizontalDragDistance
                || verticalChange > SystemParameters.MinimumVerticalDragDistance;
+    }
+
+    private static T? FindAncestor<T>(DependencyObject? source)
+        where T : DependencyObject
+    {
+        while (source is not null)
+        {
+            if (source is T target)
+            {
+                return target;
+            }
+
+            source = VisualTreeHelper.GetParent(source);
+        }
+
+        return null;
     }
 
     private bool TryGetLibrary(out LibraryLocation location)
