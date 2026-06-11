@@ -22,6 +22,13 @@ namespace AssetManager.Desktop;
 public partial class MainWindow : Window, INotifyPropertyChanged
 {
     private const string AssetListDragDataFormat = "AssetManager.Desktop.AssetListDrag";
+    private const double DefaultAssetTileWidth = 222d;
+    private const double DefaultAssetTileHeight = 298d;
+    private const double DefaultAssetCardWidth = 210d;
+    private const double DefaultAssetCardHeight = 286d;
+    private const double MinAssetPreviewScale = 0.75d;
+    private const double MaxAssetPreviewScale = 1.8d;
+    private const double AssetPreviewScaleStep = 0.1d;
 
     private readonly LibraryApplicationService _libraryService;
     private readonly KnownLibraryApplicationService _knownLibraryService;
@@ -43,6 +50,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _isChangingLanguage;
     private bool _isBusy;
     private bool _isLowImpactImportEnabled;
+    private double _assetPreviewScale = 1d;
     private ThumbnailDisplaySettings _thumbnailDisplaySettings = ThumbnailDisplaySettings.Default;
     private IReadOnlyList<BackgroundTaskSnapshot> _backgroundTaskSnapshots = [];
     private BackgroundTasksWindow? _backgroundTasksWindow;
@@ -110,6 +118,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     public bool CanInteract => !_isBusy;
 
     public string BackgroundTaskStatusMessage => BuildBackgroundTaskStatusMessage();
+
+    public double AssetTileWidth => DefaultAssetTileWidth * _assetPreviewScale;
+
+    public double AssetTileHeight => DefaultAssetTileHeight * _assetPreviewScale;
+
+    public double AssetCardWidth => DefaultAssetCardWidth * _assetPreviewScale;
+
+    public double AssetCardHeight => DefaultAssetCardHeight * _assetPreviewScale;
 
     public bool IsLowImpactImportEnabled
     {
@@ -552,6 +568,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         StatusMessage = LocalizationManager.Format("StatusDraggedItemsFormat", selectedPaths.Length);
     }
 
+    private void AssetList_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+    {
+        if ((Keyboard.Modifiers & ModifierKeys.Control) != ModifierKeys.Control)
+        {
+            return;
+        }
+
+        var direction = e.Delta > 0 ? 1d : -1d;
+        SetAssetPreviewScale(_assetPreviewScale + (direction * AssetPreviewScaleStep));
+        e.Handled = true;
+    }
+
     private void CopySelection_Click(object sender, RoutedEventArgs e)
     {
         var selectedPaths = GetSelectedAvailablePaths();
@@ -800,6 +828,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         return horizontalChange > SystemParameters.MinimumHorizontalDragDistance
                || verticalChange > SystemParameters.MinimumVerticalDragDistance;
+    }
+
+    private void SetAssetPreviewScale(double scale)
+    {
+        var nextScale = Math.Clamp(scale, MinAssetPreviewScale, MaxAssetPreviewScale);
+        if (Math.Abs(_assetPreviewScale - nextScale) < 0.001d)
+        {
+            return;
+        }
+
+        _assetPreviewScale = nextScale;
+        OnPropertyChanged(nameof(AssetTileWidth));
+        OnPropertyChanged(nameof(AssetTileHeight));
+        OnPropertyChanged(nameof(AssetCardWidth));
+        OnPropertyChanged(nameof(AssetCardHeight));
     }
 
     private static T? FindAncestor<T>(DependencyObject? source)

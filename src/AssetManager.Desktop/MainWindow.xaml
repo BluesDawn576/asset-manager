@@ -199,14 +199,15 @@
                                  SelectionChanged="AssetList_SelectionChanged"
                                  PreviewMouseLeftButtonDown="AssetList_PreviewMouseLeftButtonDown"
                                  PreviewMouseMove="AssetList_PreviewMouseMove"
+                                 PreviewMouseWheel="AssetList_PreviewMouseWheel"
                                  ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                                  ScrollViewer.VerticalScrollBarVisibility="Auto"
                                  VirtualizingPanel.IsVirtualizing="True"
                                  VirtualizingPanel.VirtualizationMode="Recycling">
                             <ListBox.ItemsPanel>
                                 <ItemsPanelTemplate>
-                                    <local:VirtualizingTilePanel ItemWidth="222"
-                                                                 ItemHeight="298"
+                                    <local:VirtualizingTilePanel ItemWidth="{Binding AssetTileWidth}"
+                                                                 ItemHeight="{Binding AssetTileHeight}"
                                                                  OverscanRows="1" />
                                 </ItemsPanelTemplate>
                             </ListBox.ItemsPanel>
@@ -222,8 +223,8 @@
                             <ListBox.ItemTemplate>
                                 <DataTemplate DataType="{x:Type local:AssetRow}">
                                     <Border x:Name="CardBorder"
-                                            Width="210"
-                                            Height="286"
+                                            Width="{Binding DataContext.AssetCardWidth, RelativeSource={RelativeSource AncestorType=ListBox}}"
+                                            Height="{Binding DataContext.AssetCardHeight, RelativeSource={RelativeSource AncestorType=ListBox}}"
                                             Background="#FCFDFE"
                                             BorderBrush="#D6DCE5"
                                             BorderThickness="1"
