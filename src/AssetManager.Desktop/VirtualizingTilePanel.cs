@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Media;
@@ -350,7 +350,11 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
                 continue;
             }
 
-            ItemContainerGenerator.Remove(position, 1);
+            if (!TryRemoveGeneratorChild(position))
+            {
+                break;
+            }
+
             RemoveInternalChildRange(childIndex, 1);
         }
     }
@@ -359,8 +363,39 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
     {
         for (var childIndex = Children.Count - 1; childIndex >= 0; childIndex--)
         {
-            ItemContainerGenerator.Remove(new GeneratorPosition(childIndex, 0), 1);
+            if (!TryRemoveGeneratorChild(new GeneratorPosition(childIndex, 0)))
+            {
+                break;
+            }
+
             RemoveInternalChildRange(childIndex, 1);
+        }
+    }
+
+    /// <summary>
+    /// Safely removes a child from the ItemContainerGenerator.
+    /// When the Items collection changes (e.g. sync removes assets), the generator
+    /// may be reset mid-layout-pass, leaving its internal state null. This causes
+    /// a NullReferenceException inside ItemContainerGenerator.Remove.
+    /// Checking Status and catching the exception prevents the crash.
+    /// </summary>
+    private bool TryRemoveGeneratorChild(GeneratorPosition position)
+    {
+
+        try
+        {
+            ItemContainerGenerator.Remove(position, 1);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            // Generator position became stale due to a collection reset.
+            return false;
+        }
+        catch (NullReferenceException)
+        {
+            // Generator internal state was cleared by a concurrent Items reset.
+            return false;
         }
     }
 
