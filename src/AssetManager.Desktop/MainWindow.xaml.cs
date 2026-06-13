@@ -1828,6 +1828,7 @@ public sealed class AssetRow : INotifyPropertyChanged
         _thumbnailDisplaySettings = thumbnailDisplaySettings;
         ThumbnailFields = new ObservableCollection<ThumbnailFieldDisplay>();
         RebuildThumbnailFields();
+        IsAnimated = AnimatedImageDetector.IsAnimated(fullPath);
     }
 
     public Guid Id => _asset.Id;
@@ -1850,6 +1851,7 @@ public sealed class AssetRow : INotifyPropertyChanged
     public string RelativePath => _asset.LibraryRelativePath.Value;
 
     public string FullPath { get; }
+    public bool IsAnimated { get; }
 
     public string Notes => _asset.Notes;
 
