@@ -352,7 +352,8 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
 
             if (!TryRemoveGeneratorChild(position))
             {
-                break;
+                ResetRealizedChildren();
+                return;
             }
 
             RemoveInternalChildRange(childIndex, 1);
@@ -365,7 +366,8 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
         {
             if (!TryRemoveGeneratorChild(new GeneratorPosition(childIndex, 0)))
             {
-                break;
+                ResetRealizedChildren();
+                return;
             }
 
             RemoveInternalChildRange(childIndex, 1);
@@ -377,11 +379,10 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
     /// When the Items collection changes (e.g. sync removes assets), the generator
     /// may be reset mid-layout-pass, leaving its internal state null. This causes
     /// a NullReferenceException inside ItemContainerGenerator.Remove.
-    /// Checking Status and catching the exception prevents the crash.
+    /// Catching the exception lets the panel drop stale visual children and retry layout.
     /// </summary>
     private bool TryRemoveGeneratorChild(GeneratorPosition position)
     {
-
         try
         {
             ItemContainerGenerator.Remove(position, 1);
@@ -397,6 +398,16 @@ public sealed class VirtualizingTilePanel : VirtualizingPanel, IScrollInfo
             // Generator internal state was cleared by a concurrent Items reset.
             return false;
         }
+    }
+
+    private void ResetRealizedChildren()
+    {
+        if (Children.Count > 0)
+        {
+            RemoveInternalChildRange(0, Children.Count);
+        }
+
+        InvalidateMeasure();
     }
 
     private void UpdateScrollInfo(

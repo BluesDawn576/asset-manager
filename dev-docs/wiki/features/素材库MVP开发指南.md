@@ -40,7 +40,7 @@ Infrastructure.Storage 层位于 `src/AssetManager.Infrastructure.Storage/Librar
 Desktop 层位于 `src/AssetManager.Desktop/`：
 
 - `DesktopBootstrapper.cs` 是桌面端组合根，负责组装 `LibraryApplicationService`、SQLite/FileSystem 实现、内置类型 resolver 和预览 renderer。
-- `MainWindow.xaml` 提供素材库注册、已保存素材库下拉切换、文件夹列表、导入、搜索、同步、素材列表和预览区。
+- `MainWindow.xaml` 提供素材库注册、已保存素材库下拉切换、文件夹列表、导入、搜索、同步、素材列表和预览区；媒体预览区包含 Play/Pause/Stop 控制按钮。
 - `MainWindow.xaml.cs` 把 WPF 事件连接到 `LibraryApplicationService`，但不再直接创建 SQLite、文件系统或已知素材库注册表实现。
 - `Preview/IAssetPreviewRenderer.cs` 定义桌面端预览渲染扩展点。
 - `Preview/BuiltInAssetPreviewRenderers.cs` 提供内置图片、媒体和文本 renderer 清单。
@@ -128,7 +128,7 @@ SQLite 数据库路径固定为 `.asset-manager/asset-manager.db`。当前版本
 
 WPF UI 使用 `Preview/IAssetPreviewRenderer.cs` 管线渲染预览。内置 renderer 目前包括：
 
-- `ImageAssetPreviewRenderer`：使用 `Image` 预览 `image`。
+- `ImageAssetPreviewRenderer`：使用 `Image` 预览 `image`。动画 GIF 通过 `AnimatedImageDetector.IsAnimatedGif()` 检测（仅支持 GIF，依据帧描述符计数而非版本头），命中后交给 XamlAnimatedGif 驱动帧合成。
 - `MediaAssetPreviewRenderer`：使用 `MediaElement` 预览 `video` 和 `audio`。
 - `TextAssetPreviewRenderer`：使用只读 `TextBox` 显示 `text` 的预览内容。
 
@@ -216,3 +216,4 @@ dotnet test .\AssetManager.sln
 | 2026-06-08 16:31 | Adsicmes | 补充插件最小契约、SDK 基类和注册表说明 |
 | 2026-06-08 17:57 | Adsicmes | 补充图片缩略图缓存目录、后台加载队列和卡片显示规则 |
 | 2026-06-11 | Adsicmes | 补充 AssetViewSettings 持久化字段说明和 ui-settings.json 保存时机 |
+| 2026-06-14 | Adsicmes | 媒体预览区新增 Play/Pause/Stop 控制按钮；AnimatedImageDetector 收窄为仅 GIF 检测（IsAnimatedGif），移除 APNG/WebP 分支 |

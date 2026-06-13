@@ -1357,7 +1357,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
             else
             {
-                await RefreshAssetsAsync();
+                var selectedAssetId = (AssetList.SelectedItem as AssetRow)?.Id;
+                await RefreshAssetsAsync(selectedAssetId);
             }
 
             StatusMessage = LocalizationManager.Format(
@@ -1828,7 +1829,9 @@ public sealed class AssetRow : INotifyPropertyChanged
         _thumbnailDisplaySettings = thumbnailDisplaySettings;
         ThumbnailFields = new ObservableCollection<ThumbnailFieldDisplay>();
         RebuildThumbnailFields();
-        IsAnimated = AnimatedImageDetector.IsAnimated(fullPath);
+        IsAnimated = _asset.TypeId == AssetTypeId.Image
+                     && _asset.Status == AssetStatus.Available
+                     && AnimatedImageDetector.IsAnimatedGif(fullPath);
     }
 
     public Guid Id => _asset.Id;

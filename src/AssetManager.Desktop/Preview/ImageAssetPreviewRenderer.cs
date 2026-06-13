@@ -1,5 +1,4 @@
 ﻿using System.Windows.Media.Imaging;
-using XamlAnimatedGif;
 using AssetManager.Application.Library;
 using AssetManager.Domain.Library;
 
@@ -14,7 +13,7 @@ public sealed class ImageAssetPreviewRenderer : IAssetPreviewRenderer
 
     public void Render(AssetPreview preview, PreviewSurface surface)
     {
-        if (AnimatedImageDetector.IsAnimated(preview.FullPath))
+        if (AnimatedImageDetector.IsAnimatedGif(preview.FullPath))
         {
             // XamlAnimatedGif drives GIF frame compositing, disposal methods,
             // and infinite loop via AnimationBehavior attached property.
