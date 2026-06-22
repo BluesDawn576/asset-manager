@@ -37,6 +37,24 @@ public sealed class AssetThumbnailLoadCoordinator : IDisposable
             return;
         }
 
+        var missingCacheRows = new List<AssetRow>();
+        foreach (var row in candidates)
+        {
+            var cachePath = _thumbnailCacheService.GetUsableCachePath(location, row.Asset);
+            if (!string.IsNullOrWhiteSpace(cachePath))
+            {
+                row.SetThumbnailPath(cachePath);
+                continue;
+            }
+
+            missingCacheRows.Add(row);
+        }
+
+        if (missingCacheRows.Count == 0)
+        {
+            return;
+        }
+
         var progressFormat = LocalizationManager.Get("BackgroundTaskThumbnailProgressFormat");
         var unitLabel = LocalizationManager.Get("BackgroundTaskProgressUnitItems");
         var completedText = LocalizationManager.Get("BackgroundTaskThumbnailCompleted");
@@ -46,11 +64,11 @@ public sealed class AssetThumbnailLoadCoordinator : IDisposable
             new BackgroundTaskStartRequest(
                 BackgroundTaskKind.GenerateThumbnails,
                 LocalizationManager.Get("BackgroundTaskThumbnailTitle"),
-                string.Format(CultureInfo.CurrentCulture, progressFormat, 0, candidates.Length),
+                string.Format(CultureInfo.CurrentCulture, progressFormat, 0, missingCacheRows.Count),
                 IsCancelable: true,
                 InitialProgress: new BackgroundTaskProgress(
                     0,
-                    candidates.Length,
+                    missingCacheRows.Count,
                     unitLabel)));
 
         _session = session;
@@ -60,7 +78,7 @@ public sealed class AssetThumbnailLoadCoordinator : IDisposable
             completedText,
             canceledText,
             failedAtFormat);
-        _ = Task.Run(() => LoadAsync(location, candidates, session, taskText));
+        _ = Task.Run(() => LoadAsync(location, missingCacheRows, session, taskText));
     }
 
     public void Cancel()

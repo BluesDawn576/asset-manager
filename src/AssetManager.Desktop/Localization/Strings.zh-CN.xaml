@@ -70,6 +70,8 @@
     <sys:String x:Key="BackgroundTaskSyncFailedAtFormat">同步失败，阶段：{0}。错误：{1}</sys:String>
     <sys:String x:Key="TagFilterTooltip">必选标签，用逗号分隔</sys:String>
     <sys:String x:Key="SearchTooltip">搜索名称、标签、备注或基础元数据</sys:String>
+    <sys:String x:Key="FileFormatMismatchTooltipFormat">文件后缀 {0} 与文件头格式 {1} 不一致。</sys:String>
+    <sys:String x:Key="SingleFrameGifTooltip">该文件是单帧 GIF，不会作为动图播放。</sys:String>
     <sys:String x:Key="FoldersHeader">文件夹</sys:String>
     <sys:String x:Key="ThumbnailViewHeader">素材</sys:String>
     <sys:String x:Key="ThumbnailFieldsButton">卡片字段</sys:String>

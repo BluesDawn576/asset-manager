@@ -57,6 +57,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private double _detailsPanelWidth = DefaultDetailsPanelWidth;
     private double _assetListVerticalOffset;
     private bool _isRestoringAssetListScroll;
+    private int _fileFormatDetectionVersion;
     private AssetViewSettings _assetViewSettings = AssetViewSettings.Default;
     private ThumbnailDisplaySettings _thumbnailDisplaySettings = ThumbnailDisplaySettings.Default;
     private IReadOnlyList<BackgroundTaskSnapshot> _backgroundTaskSnapshots = [];
@@ -901,6 +902,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         ScheduleThumbnailLoading();
+        ScheduleFileFormatDetection(Assets);
         RestoreAssetListScroll();
     }
 
@@ -1249,6 +1251,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         AssetList.SelectedItem = Assets.FirstOrDefault(asset => asset.Id == visibleAssets[0].Id);
         ScheduleThumbnailLoading(insertedRows);
+        ScheduleFileFormatDetection(insertedRows);
     }
 
     private void ApplySynchronizedAssetsIncrementally(LibrarySyncResult result)
@@ -1309,6 +1312,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         if (changedRows.Count > 0)
         {
             ScheduleThumbnailLoading(changedRows);
+            ScheduleFileFormatDetection(changedRows);
         }
     }
 
@@ -1333,6 +1337,40 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         _thumbnailLoadCoordinator.Reload(_libraryLocation, rows ?? Assets);
+    }
+
+    private void ScheduleFileFormatDetection(IEnumerable<AssetRow> rows)
+    {
+        var candidates = rows
+            .Where(row => row.CanDetectFileFormat)
+            .ToArray();
+        if (candidates.Length == 0)
+        {
+            return;
+        }
+
+        var version = Interlocked.Increment(ref _fileFormatDetectionVersion);
+        _ = Task.Run(async () =>
+        {
+            foreach (var row in candidates)
+            {
+                if (version != Volatile.Read(ref _fileFormatDetectionVersion))
+                {
+                    return;
+                }
+
+                var detectedFormat = FileFormatDetector.Detect(row.FullPath);
+                await Dispatcher.InvokeAsync(
+                    () =>
+                    {
+                        if (version == Volatile.Read(ref _fileFormatDetectionVersion))
+                        {
+                            row.SetDetectedFileFormat(detectedFormat);
+                        }
+                    },
+                    DispatcherPriority.Background);
+            }
+        });
     }
 
     private void SetBusy(bool isBusy)
@@ -1899,6 +1937,7 @@ public sealed class AssetRow : INotifyPropertyChanged
     private readonly AssetRecord _asset;
     private ThumbnailDisplaySettings _thumbnailDisplaySettings;
     private Uri? _thumbnailImageUri;
+    private string? _detectedFileFormat;
 
     public AssetRow(AssetRecord asset, string fullPath, ThumbnailDisplaySettings thumbnailDisplaySettings)
     {
@@ -1908,8 +1947,8 @@ public sealed class AssetRow : INotifyPropertyChanged
         ThumbnailFields = new ObservableCollection<ThumbnailFieldDisplay>();
         RebuildThumbnailFields();
         IsAnimated = _asset.TypeId == AssetTypeId.Image
-                     && _asset.Status == AssetStatus.Available
-                     && AnimatedImageDetector.IsAnimatedGif(fullPath);
+                      && _asset.Status == AssetStatus.Available
+                      && AnimatedImageDetector.IsAnimatedGif(fullPath);
     }
 
     public Guid Id => _asset.Id;
@@ -1933,6 +1972,37 @@ public sealed class AssetRow : INotifyPropertyChanged
 
     public string FullPath { get; }
     public bool IsAnimated { get; }
+
+    public string FileFormatBadgeText => _detectedFileFormat ?? FormatExtension(_asset.Extension);
+
+    public bool HasFileFormatBadge => !string.IsNullOrWhiteSpace(FileFormatBadgeText);
+
+    public bool HasFileFormatMismatch => _detectedFileFormat is not null
+                                         && !DoesDetectedFormatMatchExtension(_detectedFileFormat, _asset.Extension);
+
+    public bool IsSingleFrameGifWarning => _detectedFileFormat == "GIF" && !IsAnimated;
+
+    public bool HasFileFormatWarning => HasFileFormatMismatch || IsSingleFrameGifWarning;
+
+    public string FileFormatWarningTooltip
+    {
+        get
+        {
+            if (HasFileFormatMismatch)
+            {
+                return LocalizationManager.Format(
+                    "FileFormatMismatchTooltipFormat",
+                    FormatExtension(_asset.Extension),
+                    _detectedFileFormat ?? string.Empty);
+            }
+
+            return IsSingleFrameGifWarning
+                ? LocalizationManager.Get("SingleFrameGifTooltip")
+                : string.Empty;
+        }
+    }
+
+    public bool CanDetectFileFormat => _asset.Status == AssetStatus.Available;
 
     public string Notes => _asset.Notes;
 
@@ -1984,6 +2054,22 @@ public sealed class AssetRow : INotifyPropertyChanged
         OnPropertyChanged(nameof(ThumbnailImageUri));
         OnPropertyChanged(nameof(HasThumbnailImage));
         OnPropertyChanged(nameof(HasPreviewImage));
+    }
+
+    public void SetDetectedFileFormat(string? detectedFileFormat)
+    {
+        if (string.Equals(_detectedFileFormat, detectedFileFormat, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        _detectedFileFormat = detectedFileFormat;
+        OnPropertyChanged(nameof(FileFormatBadgeText));
+        OnPropertyChanged(nameof(HasFileFormatBadge));
+        OnPropertyChanged(nameof(HasFileFormatMismatch));
+        OnPropertyChanged(nameof(IsSingleFrameGifWarning));
+        OnPropertyChanged(nameof(HasFileFormatWarning));
+        OnPropertyChanged(nameof(FileFormatWarningTooltip));
     }
 
     private void RebuildThumbnailFields()
@@ -2056,6 +2142,31 @@ public sealed class AssetRow : INotifyPropertyChanged
         return typeId == AssetTypeId.Unknown
             ? LocalizationManager.Get("AssetTypeUnknown")
             : typeId.Value;
+    }
+
+    private static string FormatExtension(string extension)
+    {
+        return string.IsNullOrWhiteSpace(extension)
+            ? string.Empty
+            : "." + extension.Trim().TrimStart('.').ToUpperInvariant();
+    }
+
+    private static bool DoesDetectedFormatMatchExtension(string detectedFormat, string extension)
+    {
+        var normalizedExtension = extension.Trim().TrimStart('.').ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalizedExtension))
+        {
+            return false;
+        }
+
+        return detectedFormat.ToUpperInvariant() switch
+        {
+            "JPG" => normalizedExtension is "JPG" or "JPEG",
+            "TIFF" => normalizedExtension is "TIF" or "TIFF",
+            "M4A" => normalizedExtension is "M4A" or "M4B",
+            "ASF" => normalizedExtension is "ASF" or "WMA" or "WMV",
+            var format => format == normalizedExtension
+        };
     }
 
     private void OnPropertyChanged(string propertyName)

@@ -70,6 +70,8 @@
     <sys:String x:Key="BackgroundTaskSyncFailedAtFormat">Sync failed during {0}. Error: {1}</sys:String>
     <sys:String x:Key="TagFilterTooltip">Required tags, separated by comma</sys:String>
     <sys:String x:Key="SearchTooltip">Search name, tags, notes, or metadata</sys:String>
+    <sys:String x:Key="FileFormatMismatchTooltipFormat">File extension {0} does not match detected header format {1}.</sys:String>
+    <sys:String x:Key="SingleFrameGifTooltip">This file is a single-frame GIF and will not play as animation.</sys:String>
     <sys:String x:Key="FoldersHeader">Folders</sys:String>
     <sys:String x:Key="ThumbnailViewHeader">Assets</sys:String>
     <sys:String x:Key="ThumbnailFieldsButton">Card Fields</sys:String>

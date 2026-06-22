@@ -45,6 +45,17 @@ public sealed class WindowsThumbnailCacheService
         return AwaitGenerationAsync(cachePath, generation, cancellationToken);
     }
 
+    public string? GetUsableCachePath(LibraryLocation location, AssetRecord asset)
+    {
+        if (asset.TypeId != AssetTypeId.Image || asset.Status != AssetStatus.Available)
+        {
+            return null;
+        }
+
+        var cachePath = GetCachePath(location, asset.ContentHash);
+        return IsUsableCacheFile(cachePath) ? cachePath : null;
+    }
+
     private async Task<string?> AwaitGenerationAsync(
         string cachePath,
         Lazy<Task<string?>> generation,
