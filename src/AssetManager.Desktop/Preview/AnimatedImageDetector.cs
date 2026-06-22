@@ -12,7 +12,7 @@ public static class AnimatedImageDetector
         try
         {
             using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
-            var header = new byte[11];
+            var header = new byte[13];
             if (stream.Read(header, 0, header.Length) < header.Length)
             {
                 return false;

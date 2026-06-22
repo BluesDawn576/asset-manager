@@ -1954,6 +1954,10 @@ public sealed class AssetRow : INotifyPropertyChanged
 
     public Uri? ThumbnailImageUri => _thumbnailImageUri;
 
+    public bool HasPreviewImage => IsAnimated || HasThumbnailImage;
+
+    public Uri? AnimatedImageUri => IsAnimated ? new Uri(FullPath) : null;
+
     public string PlaceholderText => _asset.Status == AssetStatus.Missing ? StatusText : TypeText;
 
     public ObservableCollection<ThumbnailFieldDisplay> ThumbnailFields { get; }
@@ -1979,6 +1983,7 @@ public sealed class AssetRow : INotifyPropertyChanged
         _thumbnailImageUri = nextThumbnailUri;
         OnPropertyChanged(nameof(ThumbnailImageUri));
         OnPropertyChanged(nameof(HasThumbnailImage));
+        OnPropertyChanged(nameof(HasPreviewImage));
     }
 
     private void RebuildThumbnailFields()
